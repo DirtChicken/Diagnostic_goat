@@ -528,6 +528,7 @@ static const char *source_hint(const char *source) {
   if (!source || !source[0]) return "";
   if (strcmp(source, "nvidia-smi") == 0) return "nvidia-smi";
   if (strcmp(source, "hwinfo") == 0) return "HWiNFO";
+  if (strcmp(source, "amd-adl") == 0) return "AMD driver";
   if (strcmp(source, "librehardwaremonitor") == 0) return "built in";
   if (strcmp(source, "acpi-thermal-zone") == 0) return "ACPI zone, not the CPU die";
   if (strcmp(source, "unavailable") == 0) return "no sensor";
@@ -1076,7 +1077,7 @@ static void create_controls(HWND hwnd) {
   g_run = CreateWindowW(L"BUTTON", L"Run diagnostic", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_RUN, NULL, NULL);
   g_log = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, 0, 10, 10, hwnd, NULL, NULL, NULL);
   SendMessageW(g_log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
-  set_utf8(g_log, "This is the Diagnostic Chicken window. Close it to stop. It does not start with Windows.\r\n\r\nTemperatures are read inside this app. Windows may ask for administrator approval so the sensor reader can see the chip. You do not open a second monitor.\r\n\r\nRun diagnostic says what the log points to, then the usual fixes.");
+  set_utf8(g_log, "This is the Diagnostic Chicken window. Close it to stop. It does not start with Windows.\r\n\r\nCPU and GPU temperatures are read inside this app. You do not open another program. Windows may ask for administrator approval so the CPU sensor can see the chip.\r\n\r\nRun diagnostic says what the log points to, then the usual fixes.");
 }
 
 static void place(HWND hwnd, int x, int y, int w, int h) {

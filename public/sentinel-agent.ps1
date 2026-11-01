@@ -71,7 +71,7 @@ function Get-LibrarySensors {
     if (-not $script:SensorComputer) {
       [void][System.Reflection.Assembly]::LoadFrom($dll)
       $computer = New-Object LibreHardwareMonitor.Hardware.Computer
-      foreach ($flag in @("IsCpuEnabled", "IsCPUEnabled", "IsGpuEnabled", "IsGPUEnabled", "IsMotherboardEnabled", "IsStorageEnabled", "IsMemoryEnabled")) {
+      foreach ($flag in @("IsCpuEnabled", "IsCPUEnabled")) {
         Enable-SensorFlag $computer $flag
       }
       $computer.Open()
@@ -100,6 +100,142 @@ function Get-SensorPack {
     } catch {}
   }
   return @()
+}
+
+function Get-AmdGpus {
+  if ($script:AmdFailed) { return @() }
+  $dll = Join-Path $env:SystemRoot "System32\atiadlxx.dll"
+  if (-not (Test-Path $dll)) { return @() }
+  if (-not ("AmdAdl.Api" -as [type])) {
+    try {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace AmdAdl {
+  public static class Api {
+    const int INFO = 1568;
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate IntPtr AllocCb(int size);
+    static AllocCb _alloc = Alloc;
+    static IntPtr Alloc(int size) { return Marshal.AllocHGlobal(size); }
+    [DllImport("atiadlxx.dll", CallingConvention = CallingConvention.Cdecl)]
+    static extern int ADL2_Main_Control_Create(AllocCb cb, int connected, out IntPtr ctx);
+    [DllImport("atiadlxx.dll", CallingConvention = CallingConvention.Cdecl)]
+    static extern int ADL2_Adapter_NumberOfAdapters_Get(IntPtr ctx, out int num);
+    [DllImport("atiadlxx.dll", CallingConvention = CallingConvention.Cdecl)]
+    static extern int ADL2_Adapter_AdapterInfo_Get(IntPtr ctx, IntPtr info, int size);
+    [DllImport("atiadlxx.dll", CallingConvention = CallingConvention.Cdecl)]
+    static extern int ADL2_New_QueryPMLogData_Get(IntPtr ctx, int index, ref ADLPMLogDataOutput data);
+    [DllImport("atiadlxx.dll", CallingConvention = CallingConvention.Cdecl)]
+    static extern int ADL2_Overdrive8_Temperature_Get(IntPtr ctx, int index, int kind, out int temperature);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Sensor { public int supported; public int value; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ADLPMLogDataOutput {
+      public int size;
+      [MarshalAs(UnmanagedType.ByValArray, SizeConst = 256)]
+      public Sensor[] sensors;
+    }
+    static IntPtr _ctx;
+    static bool _ready;
+    static string TextAt(byte[] raw, int offset) {
+      int end = offset;
+      int limit = Math.Min(raw.Length, offset + 256);
+      while (end < limit && raw[end] != 0) end++;
+      if (end == offset) return "";
+      return Encoding.ASCII.GetString(raw, offset, end - offset).Trim();
+    }
+    static int SensorValue(ADLPMLogDataOutput log, int id, bool temp) {
+      if (log.sensors == null || id < 0 || id >= log.sensors.Length) return -1;
+      if (log.sensors[id].supported == 0) return -1;
+      int v = log.sensors[id].value;
+      if (temp && v > 200) v = v / 1000;
+      return v;
+    }
+    public static string Read() {
+      try {
+      if (!_ready) {
+        IntPtr ctx;
+        if (ADL2_Main_Control_Create(_alloc, 1, out ctx) < 0 || ctx == IntPtr.Zero) return "";
+        _ctx = ctx;
+        _ready = true;
+      }
+      int count;
+      if (ADL2_Adapter_NumberOfAdapters_Get(_ctx, out count) < 0 || count <= 0) return "";
+      if (count > 16) count = 16;
+      IntPtr buf = Marshal.AllocHGlobal(count * INFO);
+      try {
+        if (ADL2_Adapter_AdapterInfo_Get(_ctx, buf, count * INFO) < 0) return "";
+        var lines = new StringBuilder();
+        var seen = new System.Collections.Generic.HashSet<string>();
+        for (int i = 0; i < count; i++) {
+          byte[] raw = new byte[INFO];
+          Marshal.Copy(IntPtr.Add(buf, i * INFO), raw, 0, INFO);
+          int vendor = BitConverter.ToInt32(raw, 276);
+          if (vendor != 0x1002) continue;
+          int index = BitConverter.ToInt32(raw, 4);
+          int present = BitConverter.ToInt32(raw, 792);
+          if (present == 0) continue;
+          string name = TextAt(raw, 280);
+          if (name.Length == 0) name = "AMD Radeon";
+          int temp = -1;
+          int load = -1;
+          var log = new ADLPMLogDataOutput();
+          log.size = Marshal.SizeOf(typeof(ADLPMLogDataOutput));
+          log.sensors = new Sensor[256];
+          if (ADL2_New_QueryPMLogData_Get(_ctx, index, ref log) >= 0) {
+            int edge = SensorValue(log, 8, true);
+            int gfx = SensorValue(log, 28, true);
+            int hot = SensorValue(log, 27, true);
+            temp = edge > 0 ? edge : (gfx > 0 ? gfx : hot);
+            load = SensorValue(log, 19, false);
+          }
+          if (temp <= 0) {
+            int milli;
+            if (ADL2_Overdrive8_Temperature_Get(_ctx, index, 1, out milli) >= 0 && milli > 0) {
+              temp = milli > 200 ? milli / 1000 : milli;
+            }
+          }
+          if (temp <= 0) continue;
+          if (!seen.Add(name)) continue;
+          lines.Append(name).Append('|').Append(temp).Append('|').Append(load).Append('\n');
+        }
+        return lines.ToString();
+      } finally {
+        Marshal.FreeHGlobal(buf);
+      }
+      } catch { return ""; }
+    }
+  }
+}
+'@
+    } catch {
+      $script:AmdFailed = $true
+      $script:AmdError = $_.Exception.Message
+      return @()
+    }
+  }
+  try {
+    $text = [AmdAdl.Api]::Read()
+  } catch {
+    return @()
+  }
+  $rows = @()
+  foreach ($line in @($text -split "`n")) {
+    if (-not $line) { continue }
+    $parts = @($line.Split("|"))
+    if ($parts.Count -lt 2) { continue }
+    $temp = Convert-Num $parts[1]
+    $load = Convert-Num $parts[2]
+    if ($null -eq $temp -or $temp -lt 1 -or $temp -gt 125) { continue }
+    $rows += [pscustomobject]@{
+      name  = $parts[0].Trim()
+      tempC = [math]::Round([double]$temp, 1)
+      load  = $(if ($null -ne $load -and $load -ge 0) { [int]$load } else { $null })
+    }
+  }
+  return $rows
 }
 
 function Get-NvidiaSmiPath {
@@ -437,6 +573,21 @@ function Get-LiveReading {
   }
 
   if ($null -eq $cpuTemp) {
+    $cpuFile = Join-Path $PSScriptRoot "cpu-temp.json"
+    if (Test-Path $cpuFile) {
+      try {
+        $age = (Get-Date) - (Get-Item -LiteralPath $cpuFile).LastWriteTime
+        $saved = Get-Content -LiteralPath $cpuFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $savedTemp = Convert-Num $saved.tempC
+        if ($age.TotalSeconds -lt 20 -and $null -ne $savedTemp -and $savedTemp -ge 1 -and $savedTemp -le 125) {
+          $cpuTemp = [math]::Round([double]$savedTemp, 1)
+          $cpuTempSource = "librehardwaremonitor"
+        }
+      } catch {}
+    }
+  }
+
+  if ($null -eq $cpuTemp) {
     try {
       $zones = @(Get-CimInstance -Namespace "root/wmi" -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop)
       $best = $null
@@ -537,51 +688,20 @@ function Get-LiveReading {
     }
     Add-MonitorGpu $gpus ([string]$adapter.name) ([string]$adapter.driver) $tempC $source $null
   }
-  try {
-    Start-HwinfoReader
-    $hw = @(Get-HwinfoReadings)
-  } catch {
-    $hw = @()
-  }
-  $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and $_.Label -match "Package|Tctl|Tdie|CPU Die" -and $_.Label -notmatch "Power|Clock|Distance" } | Select-Object -First 1
-  if (-not $cpuFromHw) {
-    $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and ($_.Sensor -match "CPU|Intel Core|Ryzen|Core i") -and $_.Label -match "Core" -and $_.Label -notmatch "Distance|Clock|Usage|Utility|Effective" } | Sort-Object { Convert-HwinfoTemp $_ } -Descending | Select-Object -First 1
-  }
-  if ($cpuFromHw) {
-    $converted = Convert-HwinfoTemp $cpuFromHw
-    if ($null -ne $converted -and $converted -ge 1 -and $converted -le 125) {
-      $cpuTemp = $converted
-      $cpuTempSource = "hwinfo"
-    }
-  }
-  $gpuTemps = @($hw | Where-Object {
-      $_.Type -eq 1 -and $_.Sensor -notmatch "Virtual|Meta" -and (
-        $_.Label -match "GPU Temperature|GPU Temp|GPU Core|GPU Hot" -or ($_.Sensor -match "GPU|GeForce|Radeon|NVIDIA|UHD|Arc" -and $_.Label -match "Temperature|Temp|Hot Spot")
-      ) -and $_.Label -notmatch "Memory|VRM|Power"
-    })
-  $gpuCore = @($gpuTemps | Where-Object { $_.Label -notmatch "Hot Spot|Hotspot" })
-  if ($gpuCore.Count -gt 0) { $gpuTemps = $gpuCore }
-  $gpuTemps = @($gpuTemps | Sort-Object { if ($_.Label -eq "GPU Temperature") { 0 } elseif ($_.Label -match "GPU Temperature") { 1 } else { 2 } })
-  foreach ($reading in $gpuTemps) {
-    $converted = Convert-HwinfoTemp $reading
-    if ($null -eq $converted -or $converted -lt 1 -or $converted -gt 125) { continue }
-    $sensorName = [string]$reading.Sensor
-    $pretty = $sensorName -replace "^(iGPU|dGPU|GPU) \[#\d+\]:\s*", ""
-    if (-not $pretty) { $pretty = $reading.Label }
+  foreach ($card in @(Get-AmdGpus)) {
     $matched = $false
     for ($i = 0; $i -lt $gpus.Count; $i++) {
       $have = $gpus[$i]
-      if ($have.name -and ($have.name -eq $pretty -or $pretty -like "*$($have.name)*" -or $have.name -like "*$pretty*")) {
-        $have.tempC = $converted
-        $have.tempSource = "hwinfo"
+      if ($have.name -and ($card.name -like "*$($have.name)*" -or $have.name -like "*$($card.name)*")) {
+        $have.tempC = $card.tempC
+        $have.tempSource = "amd-adl"
+        if ($null -ne $card.load) { $have.loadPercent = $card.load }
         $gpus[$i] = $have
         $matched = $true
         break
       }
     }
-    if (-not $matched) {
-      Add-MonitorGpu $gpus $pretty $null $converted "hwinfo" $null
-    }
+    if (-not $matched) { Add-MonitorGpu $gpus ([string]$card.name) $null $card.tempC "amd-adl" $card.load }
   }
 
   if ($gpus.Count -eq 0) {
@@ -594,12 +714,8 @@ function Get-LiveReading {
         tempSource  = "unavailable"
       })
   } elseif (-not @($gpus | Where-Object { $null -ne $_.tempC })) {
-    if ($script:HwinfoMissing) {
-      Add-Note $notes "Install HWiNFO from hwinfo.com. Diagnostic Chicken reads its CPU and GPU sensors."
-    } elseif ($script:HwinfoNeedsSetting) {
-      Add-Note $notes "In HWiNFO open Settings, enable Shared Memory Support, then restart HWiNFO."
-    } elseif ($script:HwinfoLaunched) {
-      Add-Note $notes "HWiNFO was restarted with sensor sharing on. Temperatures appear once its sensors window is open."
+    if ($script:AmdFailed -and $script:AmdError) {
+      Add-Note $notes "The AMD driver did not return a GPU temperature. $($script:AmdError)"
     } else {
       Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
     }
@@ -708,13 +824,20 @@ function Read-RequestPath($stream) {
 
 if ($args -contains "-SensorWorker") {
   $ErrorActionPreference = "Continue"
-  $script:UseLibrary = $false
-  function Write-Live {
+  $script:UseLibrary = $true
+  function Publish-CpuTemp {
     try {
-      $json = Get-LiveReading | ConvertTo-Json -Depth 6 -Compress
-      $path = Join-Path $PSScriptRoot "live.json"
+      $pack = @(Get-LibrarySensors)
+      $sensor = $pack | Where-Object { (Test-SensorType $_ "Temperature" "2") -and ([string]$_.Name -match "Package") } | Select-Object -First 1
+      if (-not $sensor) {
+        $sensor = $pack | Where-Object { (Test-SensorType $_ "Temperature" "2") -and (([string]$_.Name -match "^Core|CPU") -or ([string]$_.Parent -match "CPU|Core i|Ryzen")) } | Select-Object -First 1
+      }
+      if (-not $sensor) { return }
+      $temp = Convert-Num $sensor.Value
+      if ($null -eq $temp -or $temp -lt 1 -or $temp -gt 125) { return }
+      $path = Join-Path $PSScriptRoot "cpu-temp.json"
       $tmp = "$path.tmp"
-      [System.IO.File]::WriteAllText($tmp, $json)
+      [System.IO.File]::WriteAllText($tmp, ('{"tempC":' + ([math]::Round([double]$temp, 1).ToString([Globalization.CultureInfo]::InvariantCulture)) + ',"source":"librehardwaremonitor"}'))
       if (Test-Path $path) { Remove-Item -LiteralPath $path -Force }
       Move-Item -LiteralPath $tmp -Destination $path -Force
     } catch {
@@ -729,11 +852,10 @@ if ($args -contains "-SensorWorker") {
     $problem = Join-Path $PSScriptRoot "sensor-error.txt"
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $admin) {
-      [System.IO.File]::WriteAllText($status, "Approve the administrator prompt so the CPU and GPU sensors can be read.")
+      [System.IO.File]::WriteAllText($status, "Approve the administrator prompt so the CPU temperature can be read.")
       return $false
     }
-    [System.IO.File]::WriteAllText($status, "Installing the sensor driver. Temperatures update after it finishes.")
-    Write-Live
+    [System.IO.File]::WriteAllText($status, "Installing the CPU sensor driver. It is part of this app and starts by itself.")
     $setup = Join-Path $PSScriptRoot "sensors\PawnIO_setup.exe"
     try {
       Expand-Sensors
@@ -747,11 +869,14 @@ if ($args -contains "-SensorWorker") {
     if (Test-Path $status) { Remove-Item -LiteralPath $status -Force }
     return [bool](Get-Service -Name "PawnIO" -ErrorAction SilentlyContinue)
   }
-  Write-Live
+  Publish-CpuTemp
   Install-PawnIo | Out-Null
-  $script:UseLibrary = $true
+  try { if ($script:SensorComputer) { $script:SensorComputer.Close() } } catch {}
+  $script:SensorComputer = $null
+  $script:SensorLibraryFailed = $false
+  $script:SensorLibraryError = $null
   while ($true) {
-    Write-Live
+    Publish-CpuTemp
     Start-Sleep -Seconds 2
   }
 }
