@@ -90,8 +90,17 @@ function Get-LibrarySensors {
 }
 
 function Get-SensorPack {
-  $builtIn = @(Get-LibrarySensors)
-  if ($builtIn.Count -gt 0) { return $builtIn }
+  $cache = Join-Path $PSScriptRoot "sensor-cache.json"
+  if (Test-Path $cache) {
+    $age = (Get-Date) - (Get-Item -LiteralPath $cache).LastWriteTime
+    if ($age.TotalSeconds -lt 20) {
+      try {
+        $parsed = Get-Content -LiteralPath $cache -Raw | ConvertFrom-Json
+        if ($null -eq $parsed) { return @() }
+        return @($parsed)
+      } catch {}
+    }
+  }
   try {
     return @(Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Sensor -ErrorAction Stop)
   } catch {
@@ -213,10 +222,13 @@ function Get-LiveReading {
     } catch {}
   }
   if ($null -eq $cpuTemp) {
-    if ($script:SensorLibraryError) {
-      Add-Note $notes "The built-in sensor reader did not start. $($script:SensorLibraryError)"
+    $errFile = Join-Path $PSScriptRoot "sensor-error.txt"
+    if (Test-Path $errFile) {
+      $detail = ((Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue) | Out-String).Trim()
+      if ($detail) { Add-Note $notes "The built-in sensor reader failed. $detail" }
+      else { Add-Note $notes "The built-in sensor reader failed. Load and the log check still work." }
     } else {
-      Add-Note $notes "No CPU die temperature yet. Approve the administrator prompt so Diagnostic Chicken can read it."
+      Add-Note $notes "CPU die temperature is still coming up. The log check does not wait on it."
     }
   }
 
@@ -426,6 +438,33 @@ function Read-RequestPath($stream) {
   return @{ method = $Matches[1]; path = (($Matches[2] -split "\?")[0]) }
 }
 
+if ($args -contains "-SensorWorker") {
+  $ErrorActionPreference = "Continue"
+  Expand-Sensors
+  $cache = Join-Path $PSScriptRoot "sensor-cache.json"
+  $errFile = Join-Path $PSScriptRoot "sensor-error.txt"
+  while ($true) {
+    try {
+      if ($script:SensorLibraryFailed) {
+        $script:SensorLibraryFailed = $false
+        $script:SensorLibraryError = $null
+        $script:SensorComputer = $null
+      }
+      $pack = @(Get-LibrarySensors)
+      if ($script:SensorLibraryError) { throw $script:SensorLibraryError }
+      $json = if ($pack.Count -eq 0) { "[]" } else { @($pack) | ConvertTo-Json -Depth 4 -Compress }
+      $tmp = "$cache.tmp"
+      [System.IO.File]::WriteAllText($tmp, $json)
+      if (Test-Path $cache) { Remove-Item -LiteralPath $cache -Force }
+      Move-Item -LiteralPath $tmp -Destination $cache -Force
+      if (Test-Path $errFile) { Remove-Item -LiteralPath $errFile -Force }
+    } catch {
+      try { [System.IO.File]::WriteAllText($errFile, $_.Exception.Message) } catch {}
+    }
+    Start-Sleep -Seconds 2
+  }
+}
+
 $listener = $null
 try {
   $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
@@ -436,17 +475,25 @@ try {
   exit 1
 }
 
-Write-Host ""
-Write-Host "Diagnostic Chicken"
-Write-Host "Listening on http://127.0.0.1:$Port/  (this PC only)"
-Write-Host "Leave this window open, then open Diagnostic Chicken in a browser on this PC."
-Write-Host "Connect, then Run diagnostic for System and Application errors."
-Write-Host "Ctrl+C stops the agent. It does not keep running after that."
-Write-Host ""
+$script:SensorProc = $null
+$script:SensorNext = Get-Date
+
+function Start-SensorWorker {
+  if ($script:SensorProc -and -not $script:SensorProc.HasExited) { return }
+  if ((Get-Date) -lt $script:SensorNext) { return }
+  $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $script:SensorProc = Start-Process -FilePath $ps -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -ArgumentList @(
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SensorWorker"
+  )
+  $script:SensorNext = (Get-Date).AddSeconds(20)
+}
+
+Start-SensorWorker
 
 try {
   while ($true) {
     $client = $listener.AcceptTcpClient()
+    Start-SensorWorker
     $client.ReceiveTimeout = 5000
     $client.SendTimeout = 20000
     $stream = $null
@@ -479,7 +526,9 @@ try {
         Send-Http $stream 404 '{"ok":false}'
       }
     } catch {
-      Write-Host "Request failed: $($_.Exception.Message)"
+      if ($stream) {
+        try { Send-Http $stream 500 '{"ok":false,"error":"request failed"}' } catch {}
+      }
     } finally {
       if ($stream) { $stream.Dispose() }
       $client.Close()

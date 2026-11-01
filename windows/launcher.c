@@ -33,6 +33,7 @@ static HWND g_cpu_name, g_gpu_name, g_notes, g_log, g_run;
 static HFONT g_font, g_font_big, g_font_small, g_font_mono;
 static HBRUSH g_bg;
 static int g_busy = 0;
+static int g_stay = 0;
 static int g_cpu_tone = 0;
 static int g_gpu_tone = 0;
 static int g_load_tone = 0;
@@ -102,6 +103,7 @@ static int relaunch_elevated(const char *exe) {
   info.fMask = SEE_MASK_NOCLOSEPROCESS;
   info.lpVerb = "runas";
   info.lpFile = exe;
+  info.lpParameters = "--stay";
   info.nShow = SW_SHOWNORMAL;
   if (!ShellExecuteExA(&info)) return 0;
   if (info.hProcess) CloseHandle(info.hProcess);
@@ -203,7 +205,7 @@ static int install_and_start(void) {
     return 0;
   }
 
-  if (!is_admin() && relaunch_elevated(installed)) return 0;
+  if (!g_stay && !is_admin() && relaunch_elevated(installed)) return 0;
 
   char ps[MAX_PATH];
   powershell_path(ps, sizeof(ps));
@@ -434,11 +436,11 @@ static void load_books(void) {
   free(json);
 }
 
-static int http_get(const char *path, char **body) {
+static int http_get(const char *path, char **body, DWORD timeout_ms) {
   *body = NULL;
   SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock == INVALID_SOCKET) return 0;
-  DWORD timeout = 60000;
+  DWORD timeout = timeout_ms ? timeout_ms : 60000;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -527,7 +529,7 @@ static void format_temp(char *out, size_t cap, int present, double value) {
 
 static void refresh_live(void) {
   char *body = NULL;
-  if (!http_get("/live", &body)) {
+  if (!http_get("/live", &body, 2500)) {
     set_utf8(g_status, "Stopped");
     free(body);
     return;
@@ -733,7 +735,7 @@ static void on_run(void) {
   UpdateWindow(g_hwnd);
 
   char *body = NULL;
-  if (!http_get("/diagnose", &body)) {
+  if (!http_get("/diagnose", &body, 60000)) {
     set_utf8(g_log, "The log check did not finish. Leave this window open and try again.");
     EnableWindow(g_run, TRUE);
     InvalidateRect(g_run, NULL, TRUE);
@@ -983,7 +985,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (wp != SIZE_MINIMIZED) layout(LOWORD(lp), HIWORD(lp));
       return 0;
     case WM_TIMER:
-      if (wp == ID_TIMER && !g_busy) refresh_live();
+      if (wp == ID_TIMER && !g_busy) {
+        SetTimer(hwnd, ID_TIMER, 2000, NULL);
+        refresh_live();
+      }
       return 0;
     case WM_COMMAND:
       if (LOWORD(wp) == ID_RUN) on_run();
@@ -1043,6 +1048,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev, LPSTR cmd, int show) {
   (void)prev;
   (void)cmd;
+  if (cmd && strstr(cmd, "--stay")) g_stay = 1;
   SetProcessDPIAware();
   load_books();
   if (!install_and_start()) return g_child ? 1 : 0;
@@ -1069,8 +1075,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev, LPSTR cmd, int show) {
   }
   ShowWindow(g_hwnd, show);
   UpdateWindow(g_hwnd);
-  refresh_live();
-  SetTimer(g_hwnd, ID_TIMER, 2000, NULL);
+  SetTimer(g_hwnd, ID_TIMER, 700, NULL);
 
   MSG message;
   while (GetMessageW(&message, NULL, 0, 0) > 0) {
