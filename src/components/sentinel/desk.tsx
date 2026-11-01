@@ -230,15 +230,15 @@ export function Desk() {
         <div className="mt-3 grid grid-cols-3 gap-2">
           <Meter
             label="CPU"
-            value={cpuTemp}
-            unit="°C"
+            value={cpuTemp == null ? null : Math.round(cpuTemp * 9 / 5 + 32)}
+            unit="°F"
             tone={tempTone(cpuTemp)}
             hint={sourceHint(sensors.origin, sensors.cpuTempSource)}
           />
           <Meter
             label="GPU"
-            value={gpuTemp}
-            unit="°C"
+            value={gpuTemp == null ? null : Math.round(gpuTemp * 9 / 5 + 32)}
+            unit="°F"
             tone={tempTone(gpuTemp)}
             hint={gpuHint(sensors)}
           />
@@ -384,7 +384,8 @@ function Meter({
   tone: "ok" | "warn" | "bad" | "muted";
   hint: string;
 }) {
-  const width = value == null ? 0 : Math.max(0, Math.min(100, unit === "°C" ? value : value));
+  const celsius = value == null ? null : unit === "°F" ? ((value - 32) * 5) / 9 : value;
+  const width = celsius == null ? 0 : Math.max(0, Math.min(100, celsius));
   const toneClass = {
     ok: "text-ok",
     warn: "text-warn",

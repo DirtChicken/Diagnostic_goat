@@ -522,9 +522,9 @@ static const char *source_hint(const char *source) {
   return "live";
 }
 
-static void format_temp(char *out, size_t cap, int present, double value) {
+static void format_temp(char *out, size_t cap, int present, double celsius) {
   if (!present) snprintf(out, cap, "—");
-  else snprintf(out, cap, "%.0f\xC2\xB0" "C", value);
+  else snprintf(out, cap, "%.0f\xC2\xB0" "F", celsius * 9.0 / 5.0 + 32.0);
 }
 
 static void refresh_live(void) {

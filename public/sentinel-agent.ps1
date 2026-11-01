@@ -169,6 +169,43 @@ function Get-GpuIdentity {
   return $script:GpuIdentity
 }
 
+function Get-GpuSensorRank([string]$name) {
+  if ($name -match "Memory|Junction|Hot Spot|Hotspot") { return 1 }
+  if ($name -match "Core|Edge|Die|GPU Temperature|^GPU$") { return 4 }
+  if ($name -match "SoC|SOC|VR") { return 2 }
+  if ($name -match "GPU|Temp") { return 3 }
+  return 0
+}
+
+function Get-MatchingGpuSensor($sensors, [string]$cardName) {
+  $best = $null
+  $bestRank = -1
+  $bestTemp = -1.0
+  foreach ($sensor in @($sensors)) {
+    if (-not (Test-SensorType $sensor "Temperature" "2")) { continue }
+    $name = [string]$sensor.Name
+    $parent = [string]$sensor.Parent
+    if ("$parent $name" -notmatch "GPU|Radeon|GeForce|Arc|NVIDIA|NVidia") { continue }
+    $rank = Get-GpuSensorRank $name
+    if ($rank -le 0) { continue }
+    $temp = Convert-Num $sensor.Value
+    if ($null -eq $temp -or $temp -lt 1 -or $temp -gt 125) { continue }
+    if ($cardName) {
+      $tokens = @($cardName.Split(" ") | Where-Object { $_.Length -ge 3 -and $_ -notmatch "^(NVIDIA|GeForce|Radeon|Graphics|Intel|AMD|Adapter|GPU)$" })
+      foreach ($token in $tokens) {
+        $token = $token -replace "[^A-Za-z0-9]", ""
+        if ($token.Length -ge 3 -and ("$parent $name" -like "*$token*")) { $rank += 3; break }
+      }
+    }
+    if ($rank -gt $bestRank -or ($rank -eq $bestRank -and $temp -gt $bestTemp)) {
+      $bestRank = $rank
+      $bestTemp = [double]$temp
+      $best = $sensor
+    }
+  }
+  return $best
+}
+
 function Get-LiveReading {
   $notes = New-Object System.Collections.Generic.List[string]
   $identity = Get-CpuIdentity
@@ -263,12 +300,19 @@ function Get-LiveReading {
     foreach ($card in $nvidia) {
       $tempSource = "unavailable"
       $tempC = $null
-      if ($null -ne $card.temp) {
+      if ($null -ne $card.temp -and [double]$card.temp -ge 1) {
         $tempC = [math]::Round([double]$card.temp, 1)
         $tempSource = "nvidia-smi"
       }
       $load = $null
       if ($null -ne $card.util) { $load = [int][math]::Round([double]$card.util, 0) }
+      if ($null -eq $tempC) {
+        $sensor = Get-MatchingGpuSensor $lhm ([string]$card.name)
+        if ($sensor) {
+          $tempC = [math]::Round((Convert-Num $sensor.Value), 1)
+          $tempSource = "librehardwaremonitor"
+        }
+      }
       $gpus.Add([ordered]@{
           name        = [string]$card.name
           driver      = [string]$card.driver
@@ -278,55 +322,38 @@ function Get-LiveReading {
         })
     }
   } else {
-    $gpuTemp = $null
-    $gpuTempSource = "unavailable"
-    $gpuLoad = $null
-    $gpuSensor = $lhm | Where-Object {
-      (Test-SensorType $_ "Temperature" "2") -and (([string]$_.Name -match "GPU Core") -or (([string]$_.Parent -match "GPU|Radeon|GeForce|Arc") -and ([string]$_.Name -match "Core|GPU")))
-    } | Select-Object -First 1
-    $loadSensor = $lhm | Where-Object {
-      (Test-SensorType $_ "Load" "3") -and ([string]$_.Name -match "GPU Core|GPU")
-    } | Select-Object -First 1
-    if ($gpuSensor) {
-      $gpuTemp = [math]::Round((Convert-Num $gpuSensor.Value), 1)
-      $gpuTempSource = "librehardwaremonitor"
-    }
-    if ($loadSensor) {
-      $gpuLoad = [int][math]::Round((Convert-Num $loadSensor.Value), 0)
-    }
     $named = @($adapters | Where-Object { $_.name })
-    if ($named.Count -eq 0 -and $gpuSensor) {
+    if ($named.Count -eq 0) {
+      $sensor = Get-MatchingGpuSensor $lhm ""
       $gpus.Add([ordered]@{
-          name        = [string]$gpuSensor.Parent
+          name        = $(if ($sensor) { [string]$sensor.Parent } else { $null })
           driver      = $null
-          loadPercent = $gpuLoad
-          tempC       = $gpuTemp
-          tempSource  = $gpuTempSource
+          loadPercent = $null
+          tempC       = $(if ($sensor) { [math]::Round((Convert-Num $sensor.Value), 1) } else { $null })
+          tempSource  = $(if ($sensor) { "librehardwaremonitor" } else { "unavailable" })
         })
     } else {
-      $index = 0
       foreach ($adapter in $named) {
+        $sensor = Get-MatchingGpuSensor $lhm ([string]$adapter.name)
         $tempC = $null
         $source = "unavailable"
-        $load = $null
-        if ($index -eq 0) {
-          $tempC = $gpuTemp
-          $source = $gpuTempSource
-          $load = $gpuLoad
+        if ($sensor) {
+          $tempC = [math]::Round((Convert-Num $sensor.Value), 1)
+          $source = "librehardwaremonitor"
         }
         $gpus.Add([ordered]@{
             name        = [string]$adapter.name
             driver      = [string]$adapter.driver
-            loadPercent = $load
+            loadPercent = $null
             tempC       = $tempC
             tempSource  = $source
           })
-        $index += 1
       }
     }
-    if ($null -eq $gpuTemp) {
-      Add-Note $notes "No GPU temperature from the built-in reader. An NVIDIA card can still report through nvidia-smi."
-    }
+  }
+  $gpuMissing = @($gpus | Where-Object { $null -eq $_.tempC })
+  if ($gpus.Count -gt 0 -and $gpuMissing.Count -eq $gpus.Count) {
+    Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
   }
 
   if ($gpus.Count -gt 1) {
