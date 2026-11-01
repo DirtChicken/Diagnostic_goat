@@ -237,6 +237,18 @@ function Add-LibraryGpus($gpus, $sensors) {
   }
 }
 
+function Convert-HwinfoText($buf, [int]$offset, [int]$len) {
+  $raw = New-Object byte[] $len
+  [Array]::Copy($buf, $offset, $raw, 0, $len)
+  $wide = 0
+  for ($i = 1; $i -lt 12; $i += 2) { if ($raw[$i] -eq 0 -and $raw[$i - 1] -ne 0) { $wide++ } }
+  if ($wide -ge 3) { return ([Text.Encoding]::Unicode.GetString($raw)).Trim([char]0).Trim() }
+  $end = 0
+  while ($end -lt $raw.Length -and $raw[$end] -ne 0) { $end++ }
+  if ($end -eq 0) { return "" }
+  return [Text.Encoding]::Default.GetString($raw, 0, $end).Trim()
+}
+
 function Get-HwinfoReadings {
   if (-not ("HwinfoMap.Native" -as [type])) {
     Add-Type -Namespace HwinfoMap -Name Native -MemberDefinition @"
@@ -273,17 +285,17 @@ function Get-HwinfoReadings {
     for ($i = 0; $i -lt $sensorCount; $i++) {
       $buf = New-Object byte[] ([int]$sensorSize)
       [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($view, [int]($sensorOff + ($i * $sensorSize))), $buf, 0, [int]$sensorSize)
-      $name = [Text.Encoding]::Default.GetString($buf, 136, 128).Trim([char]0).Trim()
-      if (-not $name) { $name = [Text.Encoding]::Default.GetString($buf, 8, 128).Trim([char]0).Trim() }
+      $name = Convert-HwinfoText $buf 136 128
+      if (-not $name) { $name = Convert-HwinfoText $buf 8 128 }
       $sensors.Add($name)
     }
     $rows = New-Object System.Collections.Generic.List[object]
     for ($i = 0; $i -lt $readCount; $i++) {
       $buf = New-Object byte[] ([int]$readSize)
       [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($view, [int]($readOff + ($i * $readSize))), $buf, 0, [int]$readSize)
-      $label = [Text.Encoding]::Default.GetString($buf, 140, 128).Trim([char]0).Trim()
-      if (-not $label) { $label = [Text.Encoding]::Default.GetString($buf, 12, 128).Trim([char]0).Trim() }
-      $unit = [Text.Encoding]::Default.GetString($buf, 268, 16).Trim([char]0).Trim()
+      $label = Convert-HwinfoText $buf 140 128
+      if (-not $label) { $label = Convert-HwinfoText $buf 12 128 }
+      $unit = Convert-HwinfoText $buf 268 16
       $index = [BitConverter]::ToUInt32($buf, 4)
       $sensorName = if ($index -lt $sensors.Count) { $sensors[$index] } else { "" }
       $rows.Add([pscustomobject]@{
@@ -507,11 +519,15 @@ function Get-LiveReading {
     }
     Add-MonitorGpu $gpus ([string]$adapter.name) ([string]$adapter.driver) $tempC $source $null
   }
-  Start-HwinfoReader
-  $hw = @(Get-HwinfoReadings)
-  $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and $_.Label -match "^(CPU Package|CPU \(Tctl/Tdie\)|CPU Die|Tdie)$" } | Select-Object -First 1
+  try {
+    Start-HwinfoReader
+    $hw = @(Get-HwinfoReadings)
+  } catch {
+    $hw = @()
+  }
+  $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and $_.Label -match "Package|Tctl|Tdie|CPU Die" -and $_.Label -notmatch "Power|Clock|Distance" } | Select-Object -First 1
   if (-not $cpuFromHw) {
-    $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and $_.Sensor -match "CPU" -and $_.Label -match "^Core" -and $_.Label -notmatch "Distance|Clock" } | Sort-Object { Convert-HwinfoTemp $_ } -Descending | Select-Object -First 1
+    $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and ($_.Sensor -match "CPU|Intel Core|Ryzen|Core i") -and $_.Label -match "Core" -and $_.Label -notmatch "Distance|Clock|Usage|Utility|Effective" } | Sort-Object { Convert-HwinfoTemp $_ } -Descending | Select-Object -First 1
   }
   if ($cpuFromHw) {
     $converted = Convert-HwinfoTemp $cpuFromHw
@@ -520,8 +536,12 @@ function Get-LiveReading {
       $cpuTempSource = "hwinfo"
     }
   }
-  $gpuTemps = @($hw | Where-Object { $_.Type -eq 1 -and $_.Label -match "GPU Temperature|GPU Core|GPU Hot Spot|GPU Hotspot" -and $_.Sensor -notmatch "Virtual|Meta" })
-  $gpuCore = @($gpuTemps | Where-Object { $_.Label -notmatch "Hot Spot|Hotspot|Memory" })
+  $gpuTemps = @($hw | Where-Object {
+      $_.Type -eq 1 -and $_.Sensor -notmatch "Virtual|Meta" -and (
+        $_.Label -match "GPU Temperature|GPU Temp|GPU Core|GPU Hot" -or ($_.Sensor -match "GPU|GeForce|Radeon|NVIDIA|UHD|Arc" -and $_.Label -match "Temperature|Temp|Hot Spot")
+      ) -and $_.Label -notmatch "Memory|VRM|Power"
+    })
+  $gpuCore = @($gpuTemps | Where-Object { $_.Label -notmatch "Hot Spot|Hotspot" })
   if ($gpuCore.Count -gt 0) { $gpuTemps = $gpuCore }
   foreach ($reading in $gpuTemps) {
     $converted = Convert-HwinfoTemp $reading
@@ -779,7 +799,15 @@ try {
         if (-not $book) { Send-Http $stream 200 "[]" }
         else { Send-Http $stream 200 $book "application/json; charset=utf-8" }
       } elseif ($request.path -eq "/live") {
-        Send-Http $stream 200 (Read-LiveJson)
+        $json = $null
+        try {
+          $script:UseLibrary = $false
+          $json = Get-LiveReading | ConvertTo-Json -Depth 6 -Compress
+        } catch {
+          $json = $null
+        }
+        if (-not $json) { $json = Read-LiveJson }
+        Send-Http $stream 200 $json
       } elseif ($request.path -eq "/diagnose") {
         Write-Host "$(Get-Date -Format HH:mm:ss)  diagnostic"
         $json = (Get-Diagnostic | ConvertTo-Json -Depth 6 -Compress)
