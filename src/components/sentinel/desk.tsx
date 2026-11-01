@@ -424,8 +424,7 @@ function Bench({ notes }: { notes: string[] }) {
           <li>This preview cannot see a PC. Open the Diagnostic Chicken desktop app on the computer you want to check.</li>
           <li>Diagnostic Chicken is a window, not a browser page. It starts only when you open it. Closing the window stops it. It is not a service and it does not start with Windows.</li>
           <li>
-            CPU die temperature still needs a sensor driver. NVIDIA temperature comes from nvidia-smi.
-            AMD and Intel need LibreHardwareMonitor with WMI enabled.
+            CPU and GPU temperatures are read inside the app. Windows asks for administrator approval so that reader can see the chip. NVIDIA cards also report through the NVIDIA driver when it is installed.
           </li>
           <li>It only listens on that PC. Other devices cannot connect to it.</li>
         </ul>
@@ -621,8 +620,8 @@ function Readout({
         <section className="panel p-4">
           <p className="text-sm text-muted">
             {events.length
-              ? "No local entry for these IDs. Ask Grok to read the message text."
-              : "No errors in this report. You can still ask Grok about the temperatures."}
+              ? "Windows logged these events, but they do not match a known crash, disk, or hardware pattern. The program named in each message is the useful part."
+              : "No critical errors or warnings in this report. If the PC is still misbehaving, run the check again right after it happens."}
           </p>
         </section>
       ) : (
@@ -672,17 +671,18 @@ function PlayCard({ hit }: { hit: ReturnType<typeof matchPlaybooks>[number] }) {
         <h3 className="text-base font-semibold text-fg">{hit.playbook.title}</h3>
         <SeverityPill severity={hit.playbook.severity} count={hit.count} />
       </div>
-      <p className="mt-2 text-sm text-muted">{hit.playbook.meaning}</p>
-      <h4 className="mt-3 text-sm font-medium text-fg">Likely causes</h4>
-      <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-muted">
-        {hit.playbook.causes.map((cause) => (
-          <li key={cause}>{cause}</li>
-        ))}
-      </ul>
-      <h4 className="mt-3 text-sm font-medium text-fg">Checks</h4>
+      <h4 className="mt-3 text-sm font-medium text-fg">What is going on</h4>
+      <p className="mt-1 text-sm text-muted">{hit.playbook.meaning}</p>
+      <h4 className="mt-3 text-sm font-medium text-fg">Common solutions</h4>
       <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-muted">
         {hit.playbook.checks.map((check) => (
           <li key={check}>{check}</li>
+        ))}
+      </ul>
+      <h4 className="mt-3 text-sm font-medium text-fg">Why it happens</h4>
+      <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-muted">
+        {hit.playbook.causes.map((cause) => (
+          <li key={cause}>{cause}</li>
         ))}
       </ul>
     </article>

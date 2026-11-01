@@ -28,7 +28,70 @@ function Test-SensorType($sensor, [string]$name, [string]$code) {
   return ($kind -eq $name -or $kind -eq $code)
 }
 
+function Expand-Sensors {
+  $dest = Join-Path $PSScriptRoot "sensors"
+  $dll = Join-Path $dest "LibreHardwareMonitorLib.dll"
+  if (Test-Path $dll) { return }
+  $zip = Join-Path $PSScriptRoot "sensors.zip"
+  if (-not (Test-Path $zip)) { return }
+  if (Test-Path $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+  New-Item -ItemType Directory -Force -Path $dest | Out-Null
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
+}
+
+function Enable-SensorFlag($computer, [string]$name) {
+  $prop = $computer.GetType().GetProperty($name)
+  if ($prop) { $prop.SetValue($computer, $true, $null) }
+}
+
+function Add-HardwareSensors($found, $hardware) {
+  try { $hardware.Update() } catch {}
+  foreach ($sensor in @($hardware.Sensors)) {
+    $found.Add([pscustomobject]@{
+        Name       = [string]$sensor.Name
+        SensorType = [string]$sensor.SensorType
+        Value      = $sensor.Value
+        Parent     = [string]$hardware.Name
+      })
+  }
+  $subs = @()
+  try { $subs = @($hardware.SubHardware) } catch { $subs = @() }
+  foreach ($sub in $subs) {
+    if ($sub) { Add-HardwareSensors $found $sub }
+  }
+}
+
+function Get-LibrarySensors {
+  if ($script:SensorLibraryFailed) { return @() }
+  Expand-Sensors
+  $dll = Join-Path $PSScriptRoot "sensors\LibreHardwareMonitorLib.dll"
+  if (-not (Test-Path $dll)) { return @() }
+  try {
+    if (-not $script:SensorComputer) {
+      [void][System.Reflection.Assembly]::LoadFrom($dll)
+      $computer = New-Object LibreHardwareMonitor.Hardware.Computer
+      foreach ($flag in @("IsCpuEnabled", "IsCPUEnabled", "IsGpuEnabled", "IsGPUEnabled", "IsMotherboardEnabled", "IsStorageEnabled", "IsMemoryEnabled")) {
+        Enable-SensorFlag $computer $flag
+      }
+      $computer.Open()
+      $script:SensorComputer = $computer
+    }
+    $found = New-Object System.Collections.Generic.List[object]
+    foreach ($hardware in @($script:SensorComputer.Hardware)) {
+      if ($hardware) { Add-HardwareSensors $found $hardware }
+    }
+    return @($found.ToArray())
+  } catch {
+    $script:SensorLibraryFailed = $true
+    $script:SensorLibraryError = $_.Exception.Message
+    return @()
+  }
+}
+
 function Get-SensorPack {
+  $builtIn = @(Get-LibrarySensors)
+  if ($builtIn.Count -gt 0) { return $builtIn }
   try {
     return @(Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Sensor -ErrorAction Stop)
   } catch {
@@ -150,7 +213,11 @@ function Get-LiveReading {
     } catch {}
   }
   if ($null -eq $cpuTemp) {
-    Add-Note $notes "No CPU die temperature. Run LibreHardwareMonitor and enable its WMI provider."
+    if ($script:SensorLibraryError) {
+      Add-Note $notes "The built-in sensor reader did not start. $($script:SensorLibraryError)"
+    } else {
+      Add-Note $notes "No CPU die temperature yet. Approve the administrator prompt so Diagnostic Chicken can read it."
+    }
   }
 
   $nvidia = @()
@@ -246,7 +313,7 @@ function Get-LiveReading {
       }
     }
     if ($null -eq $gpuTemp) {
-      Add-Note $notes "No GPU temperature. NVIDIA works through nvidia-smi. AMD and Intel need LibreHardwareMonitor with WMI enabled."
+      Add-Note $notes "No GPU temperature from the built-in reader. An NVIDIA card can still report through nvidia-smi."
     }
   }
 

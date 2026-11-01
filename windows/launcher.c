@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include "ps1.h"
 #include "html.h"
 #include "books.h"
+#include "sensors.h"
 
 #define COL_BG RGB(18, 20, 16)
 #define COL_FG RGB(232, 230, 220)
@@ -81,6 +83,31 @@ static void ps_quote(const char *in, char *out, size_t cap) {
   out[j] = 0;
 }
 
+static int is_admin(void) {
+  BOOL member = FALSE;
+  SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+  PSID sid = NULL;
+  if (!AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &sid)) {
+    return 0;
+  }
+  CheckTokenMembership(NULL, sid, &member);
+  FreeSid(sid);
+  return member ? 1 : 0;
+}
+
+static int relaunch_elevated(const char *exe) {
+  SHELLEXECUTEINFOA info;
+  ZeroMemory(&info, sizeof(info));
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.lpVerb = "runas";
+  info.lpFile = exe;
+  info.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExA(&info)) return 0;
+  if (info.hProcess) CloseHandle(info.hProcess);
+  return 1;
+}
+
 static int port_open(void) {
   SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock == INVALID_SOCKET) return 0;
@@ -147,12 +174,13 @@ static int install_and_start(void) {
   snprintf(installed, MAX_PATH, "%s\\Diagnostic Chicken.exe", dir);
   if (_stricmp(running, installed) != 0) CopyFileA(running, installed, FALSE);
 
-  char ps1[MAX_PATH], html[MAX_PATH], books_path[MAX_PATH];
+  char ps1[MAX_PATH], html[MAX_PATH], books_path[MAX_PATH], zip_path[MAX_PATH];
   snprintf(ps1, MAX_PATH, "%s\\sentinel-agent.ps1", dir);
   snprintf(html, MAX_PATH, "%s\\desk.html", dir);
   snprintf(books_path, MAX_PATH, "%s\\playbooks.json", dir);
+  snprintf(zip_path, MAX_PATH, "%s\\sensors.zip", dir);
   if (!write_file(ps1, ps1_bytes, ps1_bytes_len) || !write_file(html, html_bytes, html_bytes_len) ||
-      !write_file(books_path, books_bytes, books_bytes_len)) {
+      !write_file(books_path, books_bytes, books_bytes_len) || !write_file(zip_path, sensors_bytes, sensors_bytes_len)) {
     fail("Could not write Diagnostic Chicken's files.");
     return 0;
   }
@@ -174,6 +202,8 @@ static int install_and_start(void) {
     }
     return 0;
   }
+
+  if (!is_admin() && relaunch_elevated(installed)) return 0;
 
   char ps[MAX_PATH];
   powershell_path(ps, sizeof(ps));
@@ -484,7 +514,7 @@ static int tone_of(int present, double value) {
 static const char *source_hint(const char *source) {
   if (!source || !source[0]) return "";
   if (strcmp(source, "nvidia-smi") == 0) return "nvidia-smi";
-  if (strcmp(source, "librehardwaremonitor") == 0) return "sensor driver";
+  if (strcmp(source, "librehardwaremonitor") == 0) return "built in";
   if (strcmp(source, "acpi-thermal-zone") == 0) return "ACPI zone, not the CPU die";
   if (strcmp(source, "unavailable") == 0) return "no sensor";
   return "live";
@@ -786,44 +816,81 @@ static void on_run(void) {
   }
 
   Buf buf = {0};
-  char head[80];
-  snprintf(head, sizeof(head), "%d event%s in the System and Application logs, last 2 days.\r\n", row_count, row_count == 1 ? "" : "s");
-  buf_add(&buf, head);
-  if (!hits) {
-    buf_add(&buf, row_count ? "\r\nNo saved entry for these event IDs. The messages are below.\r\n" : "\r\nNo critical, error, or warning events in the last 2 days.\r\n");
-  }
+  int lead = -1;
   for (int h = 0; h < hits; h++) {
-    Book *book = &g_books[hit_book[h]];
-    buf_add(&buf, "\r\n");
-    buf_add(&buf, book->title);
-    buf_add(&buf, "  ·  ");
-    buf_add(&buf, book->severity);
-    if (hit_count[h] > 1) {
-      char times[24];
-      snprintf(times, sizeof(times), "  ·  %d", hit_count[h]);
-      buf_add(&buf, times);
+    if (severity_rank(g_books[hit_book[h]].severity) < 3) {
+      lead = h;
+      break;
     }
+  }
+  if (lead < 0 && hits > 0) lead = 0;
+
+  if (lead < 0 && row_count == 0) {
+    buf_add(&buf, "WHAT IS GOING ON\r\n");
+    buf_add(&buf, "Nothing in the System or Application logs from the last 2 days looks like a fault. There were no critical errors or warnings.\r\n\r\n");
+    buf_add(&buf, "COMMON SOLUTIONS\r\n");
+    buf_add(&buf, "• If the PC still misbehaves, note whether it happens at idle, in sleep, or only under load, then run this again right after it happens.\r\n");
+  } else if (lead < 0) {
+    buf_add(&buf, "WHAT IS GOING ON\r\n");
+    buf_add(&buf, "Windows recorded problems, but they do not match a known crash, disk, or hardware pattern. The program name in each message is the useful part, not the event number alone.\r\n\r\n");
+    buf_add(&buf, "COMMON SOLUTIONS\r\n");
+    buf_add(&buf, "• Update or remove the program named in the message before replacing hardware.\r\n");
+    buf_add(&buf, "• One warning is often a blip. The same message repeating is the one to chase.\r\n");
+  } else {
+    Book *book = &g_books[hit_book[lead]];
+    int rank = severity_rank(book->severity);
+    buf_add(&buf, "WHAT IS GOING ON\r\n");
+    if (rank >= 3) {
+      buf_add(&buf, "This is log noise, not the cause of a crash, heat, or a slow PC.\r\n\r\n");
+    } else if (rank == 0) {
+      buf_add(&buf, "This needs attention before it is written off as a glitch.\r\n\r\n");
+    } else if (rank == 1) {
+      buf_add(&buf, "This is a real fault, not a routine notice.\r\n\r\n");
+    } else {
+      buf_add(&buf, "This is worth a look. It is not, by itself, an emergency.\r\n\r\n");
+    }
+    buf_add(&buf, book->title);
     buf_add(&buf, "\r\n");
     buf_add(&buf, book->meaning);
-    buf_add(&buf, "\r\n");
-    if (book->cause_count) {
-      buf_add(&buf, "Likely causes\r\n");
+    buf_add(&buf, "\r\n\r\nCOMMON SOLUTIONS\r\n");
+    if (book->check_count) {
+      for (int c = 0; c < book->check_count; c++) {
+        buf_add(&buf, "• ");
+        buf_add(&buf, book->checks[c]);
+        buf_add(&buf, "\r\n");
+      }
+    } else {
       for (int c = 0; c < book->cause_count; c++) {
-        buf_add(&buf, "  • ");
+        buf_add(&buf, "• ");
         buf_add(&buf, book->causes[c]);
         buf_add(&buf, "\r\n");
       }
     }
-    if (book->check_count) {
-      buf_add(&buf, "Checks\r\n");
-      for (int c = 0; c < book->check_count; c++) {
-        buf_add(&buf, "  • ");
-        buf_add(&buf, book->checks[c]);
+    if (book->cause_count && book->check_count) {
+      buf_add(&buf, "\r\nWhy it happens\r\n");
+      for (int c = 0; c < book->cause_count; c++) {
+        buf_add(&buf, "• ");
+        buf_add(&buf, book->causes[c]);
         buf_add(&buf, "\r\n");
       }
     }
+    int extra = 0;
+    for (int h = 0; h < hits; h++) {
+      if (h == lead) continue;
+      if (!extra) buf_add(&buf, "\r\nAlso in the log\r\n");
+      extra++;
+      Book *other = &g_books[hit_book[h]];
+      buf_add(&buf, "• ");
+      buf_add(&buf, other->title);
+      if (other->check_count) {
+        buf_add(&buf, " — ");
+        buf_add(&buf, other->checks[0]);
+      }
+      buf_add(&buf, "\r\n");
+    }
   }
-  if (row_count) buf_add(&buf, "\r\nEvents\r\n");
+
+  if (row_count) buf_add(&buf, "\r\nEvents behind this\r\n");
   for (int i = 0; i < row_count; i++) {
     char title[180];
     snprintf(title, sizeof(title), "\r\n%s · %s · %d\r\n%s\r\n", rows[i].level[0] ? rows[i].level : "Event", rows[i].source, rows[i].id, rows[i].log_name);
@@ -869,7 +936,7 @@ static void create_controls(HWND hwnd) {
   g_run = CreateWindowW(L"BUTTON", L"Run diagnostic", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_RUN, NULL, NULL);
   g_log = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, 0, 10, 10, hwnd, NULL, NULL, NULL);
   SendMessageW(g_log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
-  set_utf8(g_log, "This is the Diagnostic Chicken window. Close it to stop. It does not start with Windows.\r\n\r\nRun diagnostic reads critical, error, and warning events from the System and Application logs for the last 2 days.");
+  set_utf8(g_log, "This is the Diagnostic Chicken window. Close it to stop. It does not start with Windows.\r\n\r\nTemperatures are read inside this app. Windows may ask for administrator approval so the sensor reader can see the chip. You do not open a second monitor.\r\n\r\nRun diagnostic says what the log points to, then the usual fixes.");
 }
 
 static void place(HWND hwnd, int x, int y, int w, int h) {
