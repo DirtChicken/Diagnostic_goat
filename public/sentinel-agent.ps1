@@ -90,22 +90,16 @@ function Get-LibrarySensors {
 }
 
 function Get-SensorPack {
+  if ($script:UseLibrary) { return @(Get-LibrarySensors) }
   $cache = Join-Path $PSScriptRoot "sensor-cache.json"
   if (Test-Path $cache) {
-    $age = (Get-Date) - (Get-Item -LiteralPath $cache).LastWriteTime
-    if ($age.TotalSeconds -lt 20) {
-      try {
-        $parsed = Get-Content -LiteralPath $cache -Raw | ConvertFrom-Json
-        if ($null -eq $parsed) { return @() }
-        return @($parsed)
-      } catch {}
-    }
+    try {
+      $parsed = Get-Content -LiteralPath $cache -Raw -ErrorAction Stop | ConvertFrom-Json
+      if ($null -eq $parsed) { return @() }
+      return @($parsed)
+    } catch {}
   }
-  try {
-    return @(Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Sensor -ErrorAction Stop)
-  } catch {
-    return @()
-  }
+  return @()
 }
 
 function Get-NvidiaSmiPath {
@@ -310,20 +304,32 @@ function Get-LiveReading {
   $smi = Get-NvidiaSmiPath
   if ($smi) {
     try {
-      $raw = & $smi --query-gpu=name,temperature.gpu,utilization.gpu,driver_version --format=csv,noheader,nounits 2>$null
-      foreach ($line in @($raw)) {
-        if (-not $line -or $line -match "^\s*$") { continue }
-        $parts = @($line.Split(","))
-        if ($parts.Count -lt 2) { continue }
-        $util = $null
-        $driver = $null
-        if ($parts.Count -ge 3) { $util = Convert-Num $parts[2] }
-        if ($parts.Count -ge 4) { $driver = $parts[3].Trim() }
-        $nvidia += [ordered]@{
-          name   = $parts[0].Trim()
-          temp   = Convert-Num $parts[1]
-          util   = $util
-          driver = $driver
+      $info = New-Object System.Diagnostics.ProcessStartInfo
+      $info.FileName = $smi
+      $info.Arguments = "--query-gpu=name,temperature.gpu,utilization.gpu,driver_version --format=csv,noheader,nounits"
+      $info.RedirectStandardOutput = $true
+      $info.UseShellExecute = $false
+      $info.CreateNoWindow = $true
+      $proc = New-Object System.Diagnostics.Process
+      $proc.StartInfo = $info
+      [void]$proc.Start()
+      if (-not $proc.WaitForExit(1500)) {
+        try { $proc.Kill() } catch {}
+      } else {
+        foreach ($line in @($proc.StandardOutput.ReadToEnd() -split "`r?`n")) {
+          if (-not $line -or $line -match "^\s*$") { continue }
+          $parts = @($line.Split(","))
+          if ($parts.Count -lt 2) { continue }
+          $util = $null
+          $driver = $null
+          if ($parts.Count -ge 3) { $util = Convert-Num $parts[2] }
+          if ($parts.Count -ge 4) { $driver = $parts[3].Trim() }
+          $nvidia += [ordered]@{
+            name   = $parts[0].Trim()
+            temp   = Convert-Num $parts[1]
+            util   = $util
+            driver = $driver
+          }
         }
       }
     } catch {
@@ -478,24 +484,35 @@ function Read-RequestPath($stream) {
 
 if ($args -contains "-SensorWorker") {
   $ErrorActionPreference = "Continue"
-  Expand-Sensors
-  $cache = Join-Path $PSScriptRoot "sensor-cache.json"
-  $errFile = Join-Path $PSScriptRoot "sensor-error.txt"
+  $script:UseLibrary = $false
+  function Write-Live {
+    try {
+      $json = Get-LiveReading | ConvertTo-Json -Depth 6 -Compress
+      $path = Join-Path $PSScriptRoot "live.json"
+      $tmp = "$path.tmp"
+      [System.IO.File]::WriteAllText($tmp, $json)
+      if (Test-Path $path) { Remove-Item -LiteralPath $path -Force }
+      Move-Item -LiteralPath $tmp -Destination $path -Force
+    } catch {
+      try { [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot "sensor-error.txt"), $_.Exception.Message) } catch {}
+    }
+  }
   function Install-PawnIo {
+    if ($script:PawnTried) { return $false }
+    $script:PawnTried = $true
     if (Get-Service -Name "PawnIO" -ErrorAction SilentlyContinue) { return $true }
-    $flag = Join-Path $PSScriptRoot "pawnio.tried"
     $status = Join-Path $PSScriptRoot "sensor-status.txt"
     $problem = Join-Path $PSScriptRoot "sensor-error.txt"
-    if (Test-Path $flag) { return $false }
-    New-Item -ItemType File -Force -Path $flag | Out-Null
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $admin) {
       [System.IO.File]::WriteAllText($status, "Approve the administrator prompt so the CPU and GPU sensors can be read.")
       return $false
     }
-    [System.IO.File]::WriteAllText($status, "Installing the sensor driver. CPU and GPU temperatures start after it finishes.")
+    [System.IO.File]::WriteAllText($status, "Installing the sensor driver. Temperatures update after it finishes.")
+    Write-Live
     $setup = Join-Path $PSScriptRoot "sensors\PawnIO_setup.exe"
     try {
+      Expand-Sensors
       [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
       Invoke-WebRequest -Uri "https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe" -OutFile $setup -UseBasicParsing
       Start-Process -FilePath $setup -ArgumentList "-install", "-silent" -Wait -WindowStyle Hidden | Out-Null
@@ -506,33 +523,11 @@ if ($args -contains "-SensorWorker") {
     if (Test-Path $status) { Remove-Item -LiteralPath $status -Force }
     return [bool](Get-Service -Name "PawnIO" -ErrorAction SilentlyContinue)
   }
+  Write-Live
   Install-PawnIo | Out-Null
+  $script:UseLibrary = $true
   while ($true) {
-    try {
-      if ($script:SensorLibraryFailed) {
-        $script:SensorLibraryFailed = $false
-        $script:SensorLibraryError = $null
-        $script:SensorComputer = $null
-      }
-      $pack = @(Get-LibrarySensors)
-      if ($script:SensorLibraryError) { throw $script:SensorLibraryError }
-      $hot = @($pack | Where-Object { (Test-SensorType $_ "Temperature" "2") -and $null -ne (Convert-Num $_.Value) -and (Convert-Num $_.Value) -ge 1 })
-      if ($hot.Count -eq 0 -and (Install-PawnIo)) {
-        try { if ($script:SensorComputer) { $script:SensorComputer.Close() } } catch {}
-        $script:SensorComputer = $null
-        $script:SensorLibraryFailed = $false
-        $script:SensorLibraryError = $null
-        $pack = @(Get-LibrarySensors)
-      }
-      $json = if ($pack.Count -eq 0) { "[]" } else { @($pack) | ConvertTo-Json -Depth 4 -Compress }
-      $tmp = "$cache.tmp"
-      [System.IO.File]::WriteAllText($tmp, $json)
-      if (Test-Path $cache) { Remove-Item -LiteralPath $cache -Force }
-      Move-Item -LiteralPath $tmp -Destination $cache -Force
-      if ($hot.Count -gt 0 -and (Test-Path $errFile)) { Remove-Item -LiteralPath $errFile -Force }
-    } catch {
-      try { [System.IO.File]::WriteAllText($errFile, $_.Exception.Message) } catch {}
-    }
+    Write-Live
     Start-Sleep -Seconds 2
   }
 }
@@ -551,16 +546,27 @@ $script:SensorProc = $null
 $script:SensorNext = Get-Date
 
 function Start-SensorWorker {
-  if ($script:SensorProc -and -not $script:SensorProc.HasExited) { return }
-  if ((Get-Date) -lt $script:SensorNext) { return }
-  $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-  $script:SensorProc = Start-Process -FilePath $ps -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -ArgumentList @(
-    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SensorWorker"
-  )
-  $script:SensorNext = (Get-Date).AddSeconds(20)
+  try {
+    if ($script:SensorProc -and -not $script:SensorProc.HasExited) { return }
+    if ((Get-Date) -lt $script:SensorNext) { return }
+    $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $script:SensorProc = Start-Process -FilePath $ps -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -ArgumentList @(
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SensorWorker"
+    )
+    $script:SensorNext = (Get-Date).AddSeconds(8)
+  } catch {}
 }
 
 Start-SensorWorker
+
+function Read-LiveJson {
+  $path = Join-Path $PSScriptRoot "live.json"
+  if (Test-Path $path) {
+    try { return [System.IO.File]::ReadAllText($path) } catch {}
+  }
+  $hostName = $env:COMPUTERNAME
+  return "{`"kind`":`"sentinel-agent`",`"host`":`"$hostName`",`"cpu`":{`"name`":null,`"tempC`":null,`"tempSource`":`"unavailable`",`"loadPercent`":null},`"gpus`":[{`"name`":null,`"tempC`":null,`"tempSource`":`"unavailable`",`"driver`":null,`"loadPercent`":null}],`"notes`":[`"Sensors are still starting.`"]}"
+}
 
 try {
   while ($true) {
@@ -588,8 +594,7 @@ try {
         if (-not $book) { Send-Http $stream 200 "[]" }
         else { Send-Http $stream 200 $book "application/json; charset=utf-8" }
       } elseif ($request.path -eq "/live") {
-        $json = (Get-LiveReading | ConvertTo-Json -Depth 6 -Compress)
-        Send-Http $stream 200 $json
+        Send-Http $stream 200 (Read-LiveJson)
       } elseif ($request.path -eq "/diagnose") {
         Write-Host "$(Get-Date -Format HH:mm:ss)  diagnostic"
         $json = (Get-Diagnostic | ConvertTo-Json -Depth 6 -Compress)
