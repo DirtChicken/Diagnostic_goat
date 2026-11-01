@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Diagnostic Chicken</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #121410;
+      --surface: #1b1e18;
+      --surface-2: #242820;
+      --fg: #e8e6dc;
+      --muted: #a7ab9f;
+      --accent: #e0a106;
+      --accent-fg: #1c1503;
+      --ok: #8eae72;
+      --warn: #e0a106;
+      --bad: #d4654a;
+      --line: #31362c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.5 "Segoe UI", sans-serif;
+    }
+    main { max-width: 46rem; margin: 0 auto; padding: 1.25rem 1rem 3rem; }
+    h1 { font-size: 1.8rem; margin: 0.2rem 0 0; }
+    h2 { font-size: 1.05rem; margin: 0; }
+    p { margin: 0; }
+    .kicker { color: var(--accent); font-size: 0.75rem; letter-spacing: 0.04em; font-weight: 600; }
+    .muted { color: var(--muted); }
+    .panel {
+      background: var(--surface);
+      box-shadow: 0 0 0 1px rgba(232, 230, 220, 0.08);
+      border-radius: 1rem;
+      padding: 1rem;
+      margin-top: 1rem;
+    }
+    .row { display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; }
+    .badge { border-radius: 999px; background: var(--surface-2); padding: 0.2rem 0.55rem; font-size: 0.75rem; font-weight: 600; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .meters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-top: 0.75rem; }
+    .num { font-family: Consolas, "Cascadia Mono", monospace; font-size: 1.6rem; font-variant-numeric: tabular-nums; }
+    .bar { height: 0.35rem; background: var(--surface-2); border-radius: 999px; overflow: hidden; margin-top: 0.35rem; }
+    .bar > span { display: block; height: 100%; }
+    button {
+      min-height: 2.75rem;
+      border: 0;
+      border-radius: 0.75rem;
+      background: var(--accent);
+      color: var(--accent-fg);
+      font: inherit;
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 0 1rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    ul { margin: 0.4rem 0 0; padding-left: 1.1rem; }
+    li { margin: 0.25rem 0; }
+    .event { margin-top: 0.75rem; }
+    .small { font-size: 0.8rem; }
+    .mono { font-family: Consolas, "Cascadia Mono", monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="kicker">WINDOWS FAULT DESK</p>
+    <h1>Diagnostic Chicken</h1>
+    <p class="muted" style="margin-top:0.5rem">This program is running because you opened it. Close the Diagnostic Chicken window to stop it. It does not start with Windows, and it is not a service.</p>
+    <p class="muted" style="margin-top:0.4rem">Ask Grok from the Diagnostic Chicken page you downloaded this from. Use Connect to this PC while this window stays open.</p>
+
+    <section class="panel" aria-label="Temperatures">
+      <div class="row">
+        <p class="mono small muted" id="host">DETECTING</p>
+        <span class="badge ok" id="live">Live</span>
+      </div>
+      <div class="meters">
+        <div>
+          <p class="small muted">CPU</p>
+          <p class="num" id="cpu-temp">—</p>
+          <div class="bar"><span id="cpu-bar"></span></div>
+          <p class="small muted" id="cpu-hint"> </p>
+        </div>
+        <div>
+          <p class="small muted">GPU</p>
+          <p class="num" id="gpu-temp">—</p>
+          <div class="bar"><span id="gpu-bar"></span></div>
+          <p class="small muted" id="gpu-hint"> </p>
+        </div>
+        <div>
+          <p class="small muted">CPU load</p>
+          <p class="num" id="cpu-load">—</p>
+          <div class="bar"><span id="load-bar"></span></div>
+          <p class="small muted">live</p>
+        </div>
+      </div>
+      <p class="small muted" id="cpu-name" style="margin-top:0.75rem"></p>
+      <p class="small muted" id="gpu-name"></p>
+      <button id="run" type="button" style="margin-top:1rem">Run diagnostic</button>
+      <p class="small muted" id="diag-note" style="margin-top:0.6rem">Checks the System and Application logs for critical, error, and warning events from the last 2 days.</p>
+    </section>
+
+    <section id="notes"></section>
+    <section id="books"></section>
+    <section id="events"></section>
+  </main>
+  <script>
+    const booksPromise = fetch("/playbooks.json").then((r) => r.json()).catch(() => []);
+
+    function tone(value) {
+      if (value == null) return "muted";
+      if (value >= 90) return "bad";
+      if (value >= 80) return "warn";
+      return "ok";
+    }
+    function color(name) {
+      if (name === "bad") return "#d4654a";
+      if (name === "warn") return "#e0a106";
+      if (name === "ok") return "#8eae72";
+      return "#a7ab9f";
+    }
+    function showNum(id, barId, value, unit) {
+      const el = document.getElementById(id);
+      const t = tone(value);
+      el.style.color = color(t);
+      el.textContent = value == null ? "—" : Math.round(value) + unit;
+      const bar = document.getElementById(barId);
+      const width = value == null ? 0 : Math.max(0, Math.min(100, value));
+      bar.style.width = width + "%";
+      bar.style.background = color(t);
+    }
+    function list(title, items) {
+      if (!items || !items.length) return "";
+      return "<h2 style='margin-top:0.8rem'>" + title + "</h2><ul>" + items.map((item) => "<li>" + escapeHtml(item) + "</li>").join("") + "</ul>";
+    }
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+    function asArray(value) {
+      if (Array.isArray(value)) return value;
+      if (value == null) return [];
+      return [value];
+    }
+
+    async function tick() {
+      try {
+        const body = await (await fetch("/live", { cache: "no-store" })).json();
+        const cpu = body.cpu || {};
+        const gpus = asArray(body.gpus);
+        const gpu = gpus.slice().sort((a, b) => (b.tempC || -1) - (a.tempC || -1))[0] || {};
+        document.getElementById("host").textContent = body.host || "THIS PC";
+        showNum("cpu-temp", "cpu-bar", cpu.tempC, "°C");
+        showNum("gpu-temp", "gpu-bar", gpu.tempC, "°C");
+        showNum("cpu-load", "load-bar", cpu.loadPercent, "%");
+        document.getElementById("cpu-hint").textContent = hint(cpu.tempSource);
+        document.getElementById("gpu-hint").textContent = hint(gpu.tempSource) + (gpu.loadPercent == null ? "" : " · " + Math.round(gpu.loadPercent) + "%");
+        const cpuBits = [cpu.name, cpu.cores ? cpu.cores + " cores" : "", cpu.maxMhz ? cpu.maxMhz + " MHz" : ""].filter(Boolean);
+        document.getElementById("cpu-name").textContent = cpuBits.join(" · ");
+        document.getElementById("gpu-name").textContent = [gpu.name, gpu.driver ? "driver " + gpu.driver : ""].filter(Boolean).join(" · ");
+        const notes = asArray(body.notes).filter(Boolean);
+        document.getElementById("notes").innerHTML = notes.length
+          ? "<section class='panel'><h2>Notes</h2><ul>" + notes.map((note) => "<li class='muted'>" + escapeHtml(note) + "</li>").join("") + "</ul></section>"
+          : "";
+      } catch (error) {
+        document.getElementById("live").textContent = "Stopped";
+        document.getElementById("live").className = "badge warn";
+      }
+    }
+    function hint(source) {
+      if (source === "nvidia-smi") return "nvidia-smi";
+      if (source === "librehardwaremonitor") return "sensor driver";
+      if (source === "acpi-thermal-zone") return "ACPI zone, not the CPU die";
+      if (source === "unavailable") return "no sensor";
+      return "live";
+    }
+
+    document.getElementById("run").addEventListener("click", async () => {
+      const button = document.getElementById("run");
+      const note = document.getElementById("diag-note");
+      button.disabled = true;
+      note.textContent = "Reading the System and Application logs…";
+      try {
+        const report = await (await fetch("/diagnose", { cache: "no-store" })).json();
+        const events = asArray(report.events);
+        const books = await booksPromise;
+        const hits = match(events, books);
+        document.getElementById("books").innerHTML = hits.length
+          ? hits.map(renderBook).join("")
+          : "<section class='panel'><p class='muted'>" + (events.length ? "No saved entry for these event IDs. Read the messages below." : "No critical, error, or warning events in the last 2 days.") + "</p></section>";
+        document.getElementById("events").innerHTML = "<h2 style='margin:1rem 0 0'>" + events.length + " events</h2>" + events.slice(0, 40).map(renderEvent).join("");
+        note.textContent = "System and Application, last 2 days.";
+      } catch (error) {
+        note.textContent = "The log check failed. Close any other Diagnostic Chicken window and run this one again.";
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    function match(events, books) {
+      const hits = new Map();
+      for (const event of events) {
+        for (const book of books) {
+          if (!book.ids.includes(event.eventId)) continue;
+          if (book.source && event.source && !new RegExp(book.source, "i").test(event.source)) continue;
+          const existing = hits.get(book.id);
+          if (existing) existing.count += 1;
+          else hits.set(book.id, { book, count: 1 });
+        }
+      }
+      const rank = { urgent: 0, serious: 1, watch: 2, noise: 3 };
+      return [...hits.values()].sort((a, b) => (rank[a.book.severity] ?? 9) - (rank[b.book.severity] ?? 9));
+    }
+    function renderBook(hit) {
+      const klass = hit.book.severity === "urgent" ? "bad" : hit.book.severity === "noise" ? "muted" : "warn";
+      return "<article class='panel'><div class='row'><h2>" + escapeHtml(hit.book.title) + "</h2><span class='small " + klass + "'>" + escapeHtml(hit.book.severity) + (hit.count > 1 ? " · " + hit.count : "") + "</span></div><p class='muted' style='margin-top:0.5rem'>" + escapeHtml(hit.book.meaning) + "</p>" + list("Likely causes", hit.book.causes) + list("Checks", hit.book.checks) + "</article>";
+    }
+    function renderEvent(event) {
+      const klass = event.level === "Critical" || event.level === "Error" ? "bad" : "warn";
+      return "<article class='panel event'><div class='row'><p class='mono small'>" + escapeHtml(event.source) + " · " + event.eventId + "</p><span class='small " + klass + "'>" + escapeHtml(event.level) + "</span></div><p class='mono small muted'>" + escapeHtml(event.log || "") + "</p><p class='muted' style='margin-top:0.4rem'>" + escapeHtml(event.message || "") + "</p></article>";
+    }
+
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>
