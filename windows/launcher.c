@@ -527,6 +527,7 @@ static int tone_of(int present, double value) {
 static const char *source_hint(const char *source) {
   if (!source || !source[0]) return "";
   if (strcmp(source, "nvidia-smi") == 0) return "nvidia-smi";
+  if (strcmp(source, "hwinfo") == 0) return "HWiNFO";
   if (strcmp(source, "librehardwaremonitor") == 0) return "built in";
   if (strcmp(source, "acpi-thermal-zone") == 0) return "ACPI zone, not the CPU die";
   if (strcmp(source, "unavailable") == 0) return "no sensor";

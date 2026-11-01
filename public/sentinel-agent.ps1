@@ -237,6 +237,145 @@ function Add-LibraryGpus($gpus, $sensors) {
   }
 }
 
+function Get-HwinfoReadings {
+  if (-not ("HwinfoMap.Native" -as [type])) {
+    Add-Type -Namespace HwinfoMap -Name Native -MemberDefinition @"
+      [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+      public static extern System.IntPtr OpenFileMapping(uint dwDesiredAccess, bool bInheritHandle, string lpName);
+      [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+      public static extern System.IntPtr MapViewOfFile(System.IntPtr hFileMappingObject, uint dwDesiredAccess, uint dwFileOffsetHigh, uint dwFileOffsetLow, System.UIntPtr dwNumberOfBytesToMap);
+      [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+      public static extern bool UnmapViewOfFile(System.IntPtr lpBaseAddress);
+      [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+      public static extern bool CloseHandle(System.IntPtr hObject);
+"@
+  }
+  $h = [HwinfoMap.Native]::OpenFileMapping(4, $false, "Global\HWiNFO_SENS_SM2")
+  if ($h -eq [IntPtr]::Zero) { return @() }
+  $view = [HwinfoMap.Native]::MapViewOfFile($h, 4, 0, 0, [UIntPtr]::Zero)
+  if ($view -eq [IntPtr]::Zero) {
+    [void][HwinfoMap.Native]::CloseHandle($h)
+    return @()
+  }
+  try {
+    $head = New-Object byte[] 48
+    [Runtime.InteropServices.Marshal]::Copy($view, $head, 0, 48)
+    if ([BitConverter]::ToUInt32($head, 0) -ne 0x53695748) { return @() }
+    $sensorOff = [BitConverter]::ToUInt32($head, 20)
+    $sensorSize = [BitConverter]::ToUInt32($head, 24)
+    $sensorCount = [BitConverter]::ToUInt32($head, 28)
+    $readOff = [BitConverter]::ToUInt32($head, 32)
+    $readSize = [BitConverter]::ToUInt32($head, 36)
+    $readCount = [BitConverter]::ToUInt32($head, 40)
+    if ($sensorCount -gt 512 -or $readCount -gt 4096) { return @() }
+    if ($sensorSize -lt 264 -or $sensorSize -gt 4096 -or $readSize -lt 292 -or $readSize -gt 8192) { return @() }
+    $sensors = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $sensorCount; $i++) {
+      $buf = New-Object byte[] ([int]$sensorSize)
+      [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($view, [int]($sensorOff + ($i * $sensorSize))), $buf, 0, [int]$sensorSize)
+      $name = [Text.Encoding]::Default.GetString($buf, 136, 128).Trim([char]0).Trim()
+      if (-not $name) { $name = [Text.Encoding]::Default.GetString($buf, 8, 128).Trim([char]0).Trim() }
+      $sensors.Add($name)
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $readCount; $i++) {
+      $buf = New-Object byte[] ([int]$readSize)
+      [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($view, [int]($readOff + ($i * $readSize))), $buf, 0, [int]$readSize)
+      $label = [Text.Encoding]::Default.GetString($buf, 140, 128).Trim([char]0).Trim()
+      if (-not $label) { $label = [Text.Encoding]::Default.GetString($buf, 12, 128).Trim([char]0).Trim() }
+      $unit = [Text.Encoding]::Default.GetString($buf, 268, 16).Trim([char]0).Trim()
+      $index = [BitConverter]::ToUInt32($buf, 4)
+      $sensorName = if ($index -lt $sensors.Count) { $sensors[$index] } else { "" }
+      $rows.Add([pscustomobject]@{
+          Type   = [BitConverter]::ToUInt32($buf, 0)
+          Sensor = $sensorName
+          Label  = $label
+          Unit   = $unit
+          Value  = [BitConverter]::ToDouble($buf, 284)
+        })
+    }
+    return @($rows.ToArray())
+  } catch {
+    return @()
+  } finally {
+    [void][HwinfoMap.Native]::UnmapViewOfFile($view)
+    [void][HwinfoMap.Native]::CloseHandle($h)
+  }
+}
+
+function Convert-HwinfoTemp($reading) {
+  $value = Convert-Num $reading.Value
+  if ($null -eq $value) { return $null }
+  if ($reading.Unit -match "F") { return [math]::Round((($value - 32) * 5 / 9), 1) }
+  return [math]::Round([double]$value, 1)
+}
+
+function Find-HwinfoExe {
+  $names = @("HWiNFO64.exe", "HWiNFO32.exe")
+  $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:LOCALAPPDATA)
+  foreach ($root in $roots) {
+    if (-not $root) { continue }
+    foreach ($name in $names) {
+      $candidate = Join-Path $root "HWiNFO64\$name"
+      if (Test-Path $candidate) { return $candidate }
+    }
+  }
+  $keys = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
+  foreach ($key in $keys) {
+    foreach ($app in @(Get-ItemProperty $key -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "HWiNFO" })) {
+      if ($app.InstallLocation) {
+        foreach ($name in $names) {
+          $candidate = Join-Path $app.InstallLocation $name
+          if (Test-Path $candidate) { return $candidate }
+        }
+      }
+    }
+  }
+  return $null
+}
+
+function Enable-HwinfoShare([string]$exe) {
+  $ini = Join-Path (Split-Path $exe) "HWiNFO64.INI"
+  if (-not (Test-Path $ini)) { return }
+  try {
+    $text = [System.IO.File]::ReadAllText($ini)
+    if ($text -match "SharedMemorySupport\s*=\s*1") { return }
+    if ($text -match "SharedMemorySupport\s*=") {
+      $text = [regex]::Replace($text, "SharedMemorySupport\s*=\s*\d+", "SharedMemorySupport=1")
+    } elseif ($text -match "\[Settings\]") {
+      $text = $text -replace "\[Settings\]", "[Settings]`r`nSharedMemorySupport=1"
+    } else {
+      $text += "`r`n[Settings]`r`nSharedMemorySupport=1`r`n"
+    }
+    [System.IO.File]::WriteAllText($ini, $text)
+  } catch {}
+}
+
+function Start-HwinfoReader {
+  if ($script:HwinfoStartTried) { return }
+  $script:HwinfoStartTried = $true
+  $probe = @(Get-HwinfoReadings)
+  if ($probe.Count -gt 0) { return }
+  $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match "^HWiNFO" })
+  $exe = Find-HwinfoExe
+  if (-not $exe -and $running.Count -eq 0) {
+    $script:HwinfoMissing = $true
+    return
+  }
+  if ($running.Count -gt 0) {
+    $script:HwinfoNeedsSetting = $true
+    return
+  }
+  if ($exe) {
+    Enable-HwinfoShare $exe
+    try { Start-Process -FilePath $exe -WindowStyle Minimized | Out-Null } catch {}
+    $script:HwinfoLaunched = $true
+  }
+}
+
 function Get-LiveReading {
   $notes = New-Object System.Collections.Generic.List[string]
   $identity = Get-CpuIdentity
@@ -368,6 +507,44 @@ function Get-LiveReading {
     }
     Add-MonitorGpu $gpus ([string]$adapter.name) ([string]$adapter.driver) $tempC $source $null
   }
+  Start-HwinfoReader
+  $hw = @(Get-HwinfoReadings)
+  $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and $_.Label -match "^(CPU Package|CPU \(Tctl/Tdie\)|CPU Die|Tdie)$" } | Select-Object -First 1
+  if (-not $cpuFromHw) {
+    $cpuFromHw = $hw | Where-Object { $_.Type -eq 1 -and $_.Sensor -match "CPU" -and $_.Label -match "^Core" -and $_.Label -notmatch "Distance|Clock" } | Sort-Object { Convert-HwinfoTemp $_ } -Descending | Select-Object -First 1
+  }
+  if ($cpuFromHw) {
+    $converted = Convert-HwinfoTemp $cpuFromHw
+    if ($null -ne $converted -and $converted -ge 1 -and $converted -le 125) {
+      $cpuTemp = $converted
+      $cpuTempSource = "hwinfo"
+    }
+  }
+  $gpuTemps = @($hw | Where-Object { $_.Type -eq 1 -and $_.Label -match "GPU Temperature|GPU Core|GPU Hot Spot|GPU Hotspot" -and $_.Sensor -notmatch "Virtual|Meta" })
+  $gpuCore = @($gpuTemps | Where-Object { $_.Label -notmatch "Hot Spot|Hotspot|Memory" })
+  if ($gpuCore.Count -gt 0) { $gpuTemps = $gpuCore }
+  foreach ($reading in $gpuTemps) {
+    $converted = Convert-HwinfoTemp $reading
+    if ($null -eq $converted -or $converted -lt 1 -or $converted -gt 125) { continue }
+    $sensorName = [string]$reading.Sensor
+    $pretty = $sensorName -replace "^GPU \[#\d+\]:\s*", ""
+    if (-not $pretty) { $pretty = $reading.Label }
+    $matched = $false
+    for ($i = 0; $i -lt $gpus.Count; $i++) {
+      $have = $gpus[$i]
+      if ($have.name -and ($have.name -eq $pretty -or $pretty -like "*$($have.name)*" -or $have.name -like "*$pretty*")) {
+        $have.tempC = $converted
+        $have.tempSource = "hwinfo"
+        $gpus[$i] = $have
+        $matched = $true
+        break
+      }
+    }
+    if (-not $matched) {
+      Add-MonitorGpu $gpus $pretty $null $converted "hwinfo" $null
+    }
+  }
+
   if ($gpus.Count -eq 0) {
     Add-Note $notes "No display adapter was detected."
     $gpus.Add([ordered]@{
@@ -378,7 +555,15 @@ function Get-LiveReading {
         tempSource  = "unavailable"
       })
   } elseif (-not @($gpus | Where-Object { $null -ne $_.tempC })) {
-    Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
+    if ($script:HwinfoMissing) {
+      Add-Note $notes "Install HWiNFO from hwinfo.com. Diagnostic Chicken reads its CPU and GPU sensors."
+    } elseif ($script:HwinfoNeedsSetting) {
+      Add-Note $notes "In HWiNFO open Settings, enable Shared Memory Support, then restart HWiNFO."
+    } elseif ($script:HwinfoLaunched) {
+      Add-Note $notes "HWiNFO is starting. Temperatures show up once its sensors window is open."
+    } else {
+      Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
+    }
   }
 
   $statusFile = Join-Path $PSScriptRoot "sensor-status.txt"
