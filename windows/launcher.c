@@ -22,6 +22,7 @@
 #define COL_BAD RGB(212, 101, 74)
 #define ID_RUN 1001
 #define ID_TIMER 1
+#define HIST 180
 
 static HANDLE g_child = NULL;
 static HANDLE g_job = NULL;
@@ -30,6 +31,7 @@ static HWND g_cpu_lbl, g_gpu_lbl, g_load_lbl;
 static HWND g_cpu_temp, g_gpu_temp, g_load;
 static HWND g_cpu_hint, g_gpu_hint, g_load_hint;
 static HWND g_cpu_name, g_gpu_name, g_notes, g_log, g_run;
+static HWND g_cpu_chart, g_gpu_chart;
 static HFONT g_font, g_font_big, g_font_small, g_font_mono;
 static HBRUSH g_bg;
 static int g_busy = 0;
@@ -37,6 +39,15 @@ static int g_stay = 0;
 static int g_cpu_tone = 0;
 static int g_gpu_tone = 0;
 static int g_load_tone = 0;
+static double g_cpu_series[HIST];
+static double g_gpu_series[HIST];
+static unsigned char g_cpu_ok[HIST];
+static unsigned char g_gpu_ok[HIST];
+static int g_series_n = 0;
+static int g_series_at = 0;
+
+static int weak_gpu(const char *name);
+static void push_series(int cpu_ok, double cpu, int gpu_ok, double gpu);
 
 typedef struct {
   char title[96];
@@ -589,6 +600,7 @@ static void refresh_live(void) {
   const char *best_e = NULL;
   double best_temp = -1e9;
   int best_has = 0;
+  int best_weak = 1;
   if (gpus && *skip_ws(gpus) == '[') {
     const char *arr_end = NULL;
     span_value(gpus, &arr_end);
@@ -602,10 +614,20 @@ static void refresh_live(void) {
       double card_temp = 0;
       const char *card_temp_at = find_key(p, obj_end, "tempC");
       int card_has = card_temp_at && json_num(card_temp_at, &card_temp);
-      if (!best_s || (card_has && card_temp >= best_temp)) {
+      char card_name[160] = "";
+      const char *card_name_at = find_key(p, obj_end, "name");
+      if (card_name_at) json_string(card_name_at, card_name, sizeof(card_name));
+      int card_weak = weak_gpu(card_name);
+      int replace = 0;
+      if (!best_s) replace = 1;
+      else if (best_weak && !card_weak) replace = 1;
+      else if (!card_weak && !best_weak && card_has && (!best_has || card_temp >= best_temp)) replace = 1;
+      else if (!card_weak && card_has && !best_has) replace = 1;
+      if (replace) {
         best_s = p;
         best_e = obj_end;
         best_has = card_has;
+        best_weak = card_weak;
         if (card_has) best_temp = card_temp;
       }
       p = obj_end;
@@ -668,6 +690,9 @@ static void refresh_live(void) {
   }
   set_utf8(g_notes, notes);
   set_utf8(g_status, "Live");
+  push_series(has_temp, temp, best_has, best_has ? best_temp : 0);
+  if (g_cpu_chart) InvalidateRect(g_cpu_chart, NULL, FALSE);
+  if (g_gpu_chart) InvalidateRect(g_gpu_chart, NULL, FALSE);
   free(body);
   InvalidateRect(g_hwnd, NULL, TRUE);
 }
@@ -695,12 +720,120 @@ static void buf_add(Buf *buf, const char *text) {
 
 static int contains_ci(const char *hay, const char *needle) {
   size_t n = strlen(needle);
-  if (!n) return 1;
+  if (!n || !hay) return 0;
   for (const char *p = hay; *p; p++) {
     size_t i = 0;
-    while (i < n && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
-    if (i == n) return 1;
+    while (needle[i] && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+    if (!needle[i]) return 1;
   }
+  return 0;
+}
+
+static int weak_gpu(const char *name) {
+  if (!name || !name[0]) return 1;
+  if (contains_ci(name, "virtual")) return 1;
+  if (contains_ci(name, "meta")) return 1;
+  if (contains_ci(name, "indirect")) return 1;
+  if (contains_ci(name, "remote display")) return 1;
+  if (contains_ci(name, "basic display")) return 1;
+  if (contains_ci(name, "basic render")) return 1;
+  if (contains_ci(name, "oculus")) return 1;
+  if (contains_ci(name, "quest")) return 1;
+  return 0;
+}
+
+static void push_series(int cpu_ok, double cpu, int gpu_ok, double gpu) {
+  g_cpu_series[g_series_at] = cpu;
+  g_gpu_series[g_series_at] = gpu;
+  g_cpu_ok[g_series_at] = (unsigned char)(cpu_ok ? 1 : 0);
+  g_gpu_ok[g_series_at] = (unsigned char)(gpu_ok ? 1 : 0);
+  g_series_at = (g_series_at + 1) % HIST;
+  if (g_series_n < HIST) g_series_n++;
+}
+
+static void paint_chart(HDC dc, RECT rc, int which) {
+  HBRUSH panel = CreateSolidBrush(RGB(28, 31, 24));
+  FillRect(dc, &rc, panel);
+  DeleteObject(panel);
+  double *series = which ? g_gpu_series : g_cpu_series;
+  unsigned char *ok = which ? g_gpu_ok : g_cpu_ok;
+  int start = g_series_at - g_series_n;
+  if (start < 0) start += HIST;
+  double lo = 1e9, hi = -1e9;
+  int any = 0;
+  for (int i = 0; i < g_series_n; i++) {
+    int idx = (start + i) % HIST;
+    if (!ok[idx]) continue;
+    any = 1;
+    if (series[idx] < lo) lo = series[idx];
+    if (series[idx] > hi) hi = series[idx];
+  }
+  SetBkMode(dc, TRANSPARENT);
+  HFONT old = (HFONT)SelectObject(dc, g_font_small);
+  SetTextColor(dc, COL_MUTED);
+  if (!any) {
+    RECT box = rc;
+    box.left += 8;
+    DrawTextA(dc, "waiting", -1, &box, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+    return;
+  }
+  if (hi - lo < 8) {
+    double mid = (hi + lo) / 2.0;
+    lo = mid - 6;
+    hi = mid + 6;
+  }
+  char peak[48];
+  snprintf(peak, sizeof(peak), "peak %.0f F", hi * 9.0 / 5.0 + 32.0);
+  RECT label = rc;
+  label.left += 8;
+  label.right -= 8;
+  label.top += 3;
+  label.bottom = label.top + 16;
+  DrawTextA(dc, peak, -1, &label, DT_LEFT | DT_SINGLELINE);
+  DrawTextA(dc, g_series_n >= HIST ? "6 min" : "recent", -1, &label, DT_RIGHT | DT_SINGLELINE);
+  int left = rc.left + 8;
+  int rightx = rc.right - 8;
+  int top = rc.top + 22;
+  int bottom = rc.bottom - 6;
+  if (bottom <= top) bottom = top + 1;
+  if (rightx <= left) rightx = left + 1;
+  HPEN pen = CreatePen(PS_SOLID, 2, which ? COL_ACCENT : COL_OK);
+  HPEN old_pen = (HPEN)SelectObject(dc, pen);
+  int drawing = 0;
+  int width = rightx - left;
+  for (int i = 0; i < g_series_n; i++) {
+    int idx = (start + i) % HIST;
+    if (!ok[idx]) {
+      drawing = 0;
+      continue;
+    }
+    int x = g_series_n > 1 ? left + (i * width) / (g_series_n - 1) : rightx;
+    double t = (series[idx] - lo) / (hi - lo);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int y = bottom - (int)(t * (double)(bottom - top));
+    if (!drawing) {
+      MoveToEx(dc, x, y, NULL);
+      drawing = 1;
+    } else {
+      LineTo(dc, x, y);
+    }
+  }
+  SelectObject(dc, old_pen);
+  DeleteObject(pen);
+  SelectObject(dc, old);
+}
+
+static LRESULT CALLBACK chart_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  if (msg == WM_ERASEBKGND) return 1;
+  if (msg != WM_PAINT) return DefWindowProcW(hwnd, msg, wp, lp);
+  PAINTSTRUCT ps;
+  HDC dc = BeginPaint(hwnd, &ps);
+  RECT rc;
+  GetClientRect(hwnd, &rc);
+  paint_chart(dc, rc, (int)(INT_PTR)GetPropW(hwnd, L"series"));
+  EndPaint(hwnd, &ps);
   return 0;
 }
 
@@ -932,9 +1065,13 @@ static void create_controls(HWND hwnd) {
   g_cpu_hint = add_text(hwnd, L"", g_font_small, SS_LEFT);
   g_gpu_hint = add_text(hwnd, L"", g_font_small, SS_LEFT);
   g_load_hint = add_text(hwnd, L"live", g_font_small, SS_LEFT);
-  g_cpu_name = add_text(hwnd, L"", g_font, SS_LEFT);
-  g_gpu_name = add_text(hwnd, L"", g_font, SS_LEFT);
-  g_notes = add_text(hwnd, L"", g_font_small, SS_LEFT);
+  g_cpu_name = add_text(hwnd, L"", g_font_small, SS_LEFT | SS_NOPREFIX);
+  g_gpu_name = add_text(hwnd, L"", g_font_small, SS_LEFT | SS_NOPREFIX);
+  g_notes = add_text(hwnd, L"", g_font_small, SS_LEFT | SS_NOPREFIX);
+  g_cpu_chart = CreateWindowW(L"ChickenChart", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, NULL, NULL, NULL);
+  g_gpu_chart = CreateWindowW(L"ChickenChart", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, NULL, NULL, NULL);
+  SetPropW(g_cpu_chart, L"series", (HANDLE)0);
+  SetPropW(g_gpu_chart, L"series", (HANDLE)(INT_PTR)1);
   g_run = CreateWindowW(L"BUTTON", L"Run diagnostic", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_RUN, NULL, NULL);
   g_log = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, 0, 10, 10, hwnd, NULL, NULL, NULL);
   SendMessageW(g_log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
@@ -946,27 +1083,35 @@ static void place(HWND hwnd, int x, int y, int w, int h) {
 }
 
 static void layout(int w, int h) {
-  int pad = 24;
-  int col = (w - pad * 2 - 24) / 3;
-  if (col < 80) col = 80;
-  place(g_kicker, pad, 16, w - pad * 2, 18);
-  place(g_host, pad, 40, w - 180, 24);
-  place(g_status, w - 150, 40, 126, 24);
-  place(g_cpu_lbl, pad, 78, col, 18);
-  place(g_gpu_lbl, pad + col + 12, 78, col, 18);
-  place(g_load_lbl, pad + (col + 12) * 2, 78, col, 18);
-  place(g_cpu_temp, pad, 96, col, 42);
-  place(g_gpu_temp, pad + col + 12, 96, col, 42);
-  place(g_load, pad + (col + 12) * 2, 96, col, 42);
-  place(g_cpu_hint, pad, 140, col, 18);
-  place(g_gpu_hint, pad + col + 12, 140, col, 18);
-  place(g_load_hint, pad + (col + 12) * 2, 140, col, 18);
-  place(g_cpu_name, pad, 166, w - pad * 2, 22);
-  place(g_gpu_name, pad, 188, w - pad * 2, 22);
-  place(g_notes, pad, 214, w - pad * 2, 52);
-  place(g_run, pad, 274, 180, 40);
-  int log_y = 330;
-  place(g_log, pad, log_y, w - pad * 2, h - log_y - pad);
+  int pad = 20;
+  int gap = 16;
+  int col = (w - pad * 2 - gap * 2) / 3;
+  if (col < 100) col = 100;
+  int x1 = pad;
+  int x2 = pad + col + gap;
+  int x3 = pad + (col + gap) * 2;
+  place(g_kicker, pad, 14, w - pad * 2, 16);
+  place(g_host, pad, 34, w - 160, 26);
+  place(g_status, w - 136, 34, 116, 26);
+  place(g_cpu_lbl, x1, 68, col, 16);
+  place(g_gpu_lbl, x2, 68, col, 16);
+  place(g_load_lbl, x3, 68, col, 16);
+  place(g_cpu_temp, x1, 86, col, 40);
+  place(g_gpu_temp, x2, 86, col, 40);
+  place(g_load, x3, 86, col, 40);
+  place(g_cpu_hint, x1, 126, col, 16);
+  place(g_gpu_hint, x2, 126, col, 16);
+  place(g_load_hint, x3, 126, col, 16);
+  place(g_cpu_chart, x1, 148, col, 86);
+  place(g_gpu_chart, x2, 148, col, 86);
+  place(g_cpu_name, x1, 240, col, 36);
+  place(g_gpu_name, x2, 240, col, 36);
+  place(g_notes, pad, 280, w - pad * 2, 32);
+  place(g_run, pad, 318, 168, 36);
+  int log_y = 366;
+  if (h - log_y < 120) log_y = h - 120;
+  if (log_y < 366) log_y = 366;
+  place(g_log, pad, log_y, w - pad * 2, h - log_y - 16);
 }
 
 static COLORREF tone_color(int tone) {
@@ -1029,8 +1174,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_GETMINMAXINFO: {
       MINMAXINFO *info = (MINMAXINFO *)lp;
-      info->ptMinTrackSize.x = 680;
-      info->ptMinTrackSize.y = 520;
+      info->ptMinTrackSize.x = 760;
+      info->ptMinTrackSize.y = 680;
       return 0;
     }
     case WM_DESTROY:
@@ -1059,6 +1204,15 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev, LPSTR cmd, int show) {
   g_font_small = make_font(-14, FW_NORMAL, L"Segoe UI");
   g_font_mono = make_font(-16, FW_NORMAL, L"Consolas");
 
+  WNDCLASSW chart;
+  ZeroMemory(&chart, sizeof(chart));
+  chart.lpfnWndProc = chart_proc;
+  chart.hInstance = instance;
+  chart.lpszClassName = L"ChickenChart";
+  chart.hCursor = LoadCursor(NULL, IDC_ARROW);
+  chart.hbrBackground = g_bg;
+  RegisterClassW(&chart);
+
   WNDCLASSW klass;
   ZeroMemory(&klass, sizeof(klass));
   klass.lpfnWndProc = wndproc;
@@ -1068,7 +1222,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev, LPSTR cmd, int show) {
   klass.hbrBackground = g_bg;
   RegisterClassW(&klass);
 
-  g_hwnd = CreateWindowExW(0, L"DiagnosticChicken", L"Diagnostic Chicken", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 960, 760, NULL, NULL, instance, NULL);
+  g_hwnd = CreateWindowExW(0, L"DiagnosticChicken", L"Diagnostic Chicken", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 980, 860, NULL, NULL, instance, NULL);
   if (!g_hwnd) {
     fail("Could not open the Diagnostic Chicken window.");
     return 1;

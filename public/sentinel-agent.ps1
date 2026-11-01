@@ -153,7 +153,7 @@ function Get-GpuIdentity {
     foreach ($adapter in $adapters) {
       $name = ([string]$adapter.Name).Trim()
       if (-not $name) { continue }
-      if ($name -match "Microsoft Basic|Remote Display|Indirect Display|Virtual Display|Parsec|IddCx|Oray|Sunshine|GameViewer|Mirror") { continue }
+      if ($name -match "Microsoft Basic|Remote Display|Indirect Display|Virtual Display|Virtual Monitor|Meta Virtual|Parsec|IddCx|Oray|Sunshine|GameViewer|Mirror|Oculus|Quest|Spacedesk|AnyDesk|TeamViewer|DameWare|Citrix|Hyper-V|Basic Render") { continue }
       $found += [ordered]@{
         name   = $name
         driver = ([string]$adapter.DriverVersion).Trim()
@@ -204,6 +204,43 @@ function Get-MatchingGpuSensor($sensors, [string]$cardName) {
     }
   }
   return $best
+}
+
+function Add-MonitorGpu($gpus, [string]$name, [string]$driver, $tempC, [string]$source, $load) {
+  if ($name -match "Microsoft Basic|Remote Display|Indirect Display|Virtual Display|Virtual Monitor|Meta Virtual|Parsec|IddCx|Oray|Sunshine|GameViewer|Mirror|Oculus|Quest|Spacedesk|AnyDesk|TeamViewer|DameWare|Citrix|Hyper-V|Basic Render") { return }
+  foreach ($have in @($gpus)) {
+    if ($have.name -and $name -and ($have.name -eq $name -or $have.name -like "*$name*" -or $name -like "*$($have.name)*")) { return }
+  }
+  $gpus.Add([ordered]@{
+      name        = $name
+      driver      = $driver
+      loadPercent = $load
+      tempC       = $tempC
+      tempSource  = $source
+    })
+}
+
+function Add-LibraryGpus($gpus, $sensors) {
+  $best = @{}
+  foreach ($sensor in @($sensors)) {
+    if (-not (Test-SensorType $sensor "Temperature" "2")) { continue }
+    $sensorName = [string]$sensor.Name
+    $parent = [string]$sensor.Parent
+    if (-not $parent) { continue }
+    if ("$parent $sensorName" -notmatch "GPU|Radeon|GeForce|Arc|UHD|Iris|Graphics|NVIDIA") { continue }
+    if ((Get-GpuSensorRank $sensorName) -le 0) { continue }
+    $temp = Convert-Num $sensor.Value
+    if ($null -eq $temp -or $temp -lt 1 -or $temp -gt 125) { continue }
+    $key = $parent.ToLower()
+    if (-not $best.ContainsKey($key) -or $temp -gt $best[$key]) { $best[$key] = [math]::Round([double]$temp, 1) }
+  }
+  foreach ($key in @($best.Keys)) {
+    $parent = $key
+    foreach ($sensor in @($sensors)) {
+      if (([string]$sensor.Parent).ToLower() -eq $key) { $parent = [string]$sensor.Parent; break }
+    }
+    Add-MonitorGpu $gpus $parent $null $best[$key] "librehardwaremonitor" $null
+  }
 }
 
 function Get-LiveReading {
@@ -294,70 +331,36 @@ function Get-LiveReading {
     }
   }
 
-  $adapters = @(Get-GpuIdentity)
   $gpus = New-Object System.Collections.Generic.List[object]
-  if ($nvidia.Count -gt 0) {
-    foreach ($card in $nvidia) {
-      $tempSource = "unavailable"
-      $tempC = $null
-      if ($null -ne $card.temp -and [double]$card.temp -ge 1) {
-        $tempC = [math]::Round([double]$card.temp, 1)
-        $tempSource = "nvidia-smi"
-      }
-      $load = $null
-      if ($null -ne $card.util) { $load = [int][math]::Round([double]$card.util, 0) }
-      if ($null -eq $tempC) {
-        $sensor = Get-MatchingGpuSensor $lhm ([string]$card.name)
-        if ($sensor) {
-          $tempC = [math]::Round((Convert-Num $sensor.Value), 1)
-          $tempSource = "librehardwaremonitor"
-        }
-      }
-      $gpus.Add([ordered]@{
-          name        = [string]$card.name
-          driver      = [string]$card.driver
-          loadPercent = $load
-          tempC       = $tempC
-          tempSource  = $tempSource
-        })
+  Add-LibraryGpus $gpus $lhm
+  foreach ($card in @($nvidia)) {
+    $tempC = $null
+    $tempSource = "unavailable"
+    if ($null -ne $card.temp -and [double]$card.temp -ge 1) {
+      $tempC = [math]::Round([double]$card.temp, 1)
+      $tempSource = "nvidia-smi"
     }
-  } else {
-    $named = @($adapters | Where-Object { $_.name })
-    if ($named.Count -eq 0) {
-      $sensor = Get-MatchingGpuSensor $lhm ""
-      $gpus.Add([ordered]@{
-          name        = $(if ($sensor) { [string]$sensor.Parent } else { $null })
-          driver      = $null
-          loadPercent = $null
-          tempC       = $(if ($sensor) { [math]::Round((Convert-Num $sensor.Value), 1) } else { $null })
-          tempSource  = $(if ($sensor) { "librehardwaremonitor" } else { "unavailable" })
-        })
-    } else {
-      foreach ($adapter in $named) {
-        $sensor = Get-MatchingGpuSensor $lhm ([string]$adapter.name)
-        $tempC = $null
-        $source = "unavailable"
-        if ($sensor) {
-          $tempC = [math]::Round((Convert-Num $sensor.Value), 1)
-          $source = "librehardwaremonitor"
-        }
-        $gpus.Add([ordered]@{
-            name        = [string]$adapter.name
-            driver      = [string]$adapter.driver
-            loadPercent = $null
-            tempC       = $tempC
-            tempSource  = $source
-          })
+    $load = $null
+    if ($null -ne $card.util) { $load = [int][math]::Round([double]$card.util, 0) }
+    if ($null -eq $tempC) {
+      $sensor = Get-MatchingGpuSensor $lhm ([string]$card.name)
+      if ($sensor) {
+        $tempC = [math]::Round((Convert-Num $sensor.Value), 1)
+        $tempSource = "librehardwaremonitor"
       }
     }
+    Add-MonitorGpu $gpus ([string]$card.name) ([string]$card.driver) $tempC $tempSource $load
   }
-  $gpuMissing = @($gpus | Where-Object { $null -eq $_.tempC })
-  if ($gpus.Count -gt 0 -and $gpuMissing.Count -eq $gpus.Count) {
-    Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
-  }
-
-  if ($gpus.Count -gt 1) {
-    Add-Note $notes "$($gpus.Count) GPUs detected. The desk shows the hottest one."
+  foreach ($adapter in @(Get-GpuIdentity)) {
+    if (-not $adapter.name) { continue }
+    $sensor = Get-MatchingGpuSensor $lhm ([string]$adapter.name)
+    $tempC = $null
+    $source = "unavailable"
+    if ($sensor) {
+      $tempC = [math]::Round((Convert-Num $sensor.Value), 1)
+      $source = "librehardwaremonitor"
+    }
+    Add-MonitorGpu $gpus ([string]$adapter.name) ([string]$adapter.driver) $tempC $source $null
   }
   if ($gpus.Count -eq 0) {
     Add-Note $notes "No display adapter was detected."
@@ -368,6 +371,14 @@ function Get-LiveReading {
         tempC       = $null
         tempSource  = "unavailable"
       })
+  } elseif (-not @($gpus | Where-Object { $null -ne $_.tempC })) {
+    Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
+  }
+
+  $statusFile = Join-Path $PSScriptRoot "sensor-status.txt"
+  if (Test-Path $statusFile) {
+    $status = ((Get-Content -LiteralPath $statusFile -Raw -ErrorAction SilentlyContinue) | Out-String).Trim()
+    if ($status) { Add-Note $notes $status }
   }
 
   $cpu = [ordered]@{
@@ -470,6 +481,32 @@ if ($args -contains "-SensorWorker") {
   Expand-Sensors
   $cache = Join-Path $PSScriptRoot "sensor-cache.json"
   $errFile = Join-Path $PSScriptRoot "sensor-error.txt"
+  function Install-PawnIo {
+    if (Get-Service -Name "PawnIO" -ErrorAction SilentlyContinue) { return $true }
+    $flag = Join-Path $PSScriptRoot "pawnio.tried"
+    $status = Join-Path $PSScriptRoot "sensor-status.txt"
+    $problem = Join-Path $PSScriptRoot "sensor-error.txt"
+    if (Test-Path $flag) { return $false }
+    New-Item -ItemType File -Force -Path $flag | Out-Null
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $admin) {
+      [System.IO.File]::WriteAllText($status, "Approve the administrator prompt so the CPU and GPU sensors can be read.")
+      return $false
+    }
+    [System.IO.File]::WriteAllText($status, "Installing the sensor driver. CPU and GPU temperatures start after it finishes.")
+    $setup = Join-Path $PSScriptRoot "sensors\PawnIO_setup.exe"
+    try {
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest -Uri "https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe" -OutFile $setup -UseBasicParsing
+      Start-Process -FilePath $setup -ArgumentList "-install", "-silent" -Wait -WindowStyle Hidden | Out-Null
+      Start-Sleep -Seconds 2
+    } catch {
+      [System.IO.File]::WriteAllText($problem, $_.Exception.Message)
+    }
+    if (Test-Path $status) { Remove-Item -LiteralPath $status -Force }
+    return [bool](Get-Service -Name "PawnIO" -ErrorAction SilentlyContinue)
+  }
+  Install-PawnIo | Out-Null
   while ($true) {
     try {
       if ($script:SensorLibraryFailed) {
@@ -479,12 +516,20 @@ if ($args -contains "-SensorWorker") {
       }
       $pack = @(Get-LibrarySensors)
       if ($script:SensorLibraryError) { throw $script:SensorLibraryError }
+      $hot = @($pack | Where-Object { (Test-SensorType $_ "Temperature" "2") -and $null -ne (Convert-Num $_.Value) -and (Convert-Num $_.Value) -ge 1 })
+      if ($hot.Count -eq 0 -and (Install-PawnIo)) {
+        try { if ($script:SensorComputer) { $script:SensorComputer.Close() } } catch {}
+        $script:SensorComputer = $null
+        $script:SensorLibraryFailed = $false
+        $script:SensorLibraryError = $null
+        $pack = @(Get-LibrarySensors)
+      }
       $json = if ($pack.Count -eq 0) { "[]" } else { @($pack) | ConvertTo-Json -Depth 4 -Compress }
       $tmp = "$cache.tmp"
       [System.IO.File]::WriteAllText($tmp, $json)
       if (Test-Path $cache) { Remove-Item -LiteralPath $cache -Force }
       Move-Item -LiteralPath $tmp -Destination $cache -Force
-      if (Test-Path $errFile) { Remove-Item -LiteralPath $errFile -Force }
+      if ($hot.Count -gt 0 -and (Test-Path $errFile)) { Remove-Item -LiteralPath $errFile -Force }
     } catch {
       try { [System.IO.File]::WriteAllText($errFile, $_.Exception.Message) } catch {}
     }
