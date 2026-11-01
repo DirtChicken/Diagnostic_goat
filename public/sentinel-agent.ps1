@@ -262,7 +262,10 @@ function Get-HwinfoReadings {
       public static extern bool CloseHandle(System.IntPtr hObject);
 "@
   }
-  $h = [HwinfoMap.Native]::OpenFileMapping(4, $false, "Global\HWiNFO_SENS_SM2")
+  foreach ($name in @("Global\HWiNFO_SENS_SM2", "HWiNFO_SENS_SM2")) {
+    $h = [HwinfoMap.Native]::OpenFileMapping(4, $false, $name)
+    if ($h -ne [IntPtr]::Zero) { break }
+  }
   if ($h -eq [IntPtr]::Zero) { return @() }
   $view = [HwinfoMap.Native]::MapViewOfFile($h, 4, 0, 0, [UIntPtr]::Zero)
   if ($view -eq [IntPtr]::Zero) {
@@ -318,7 +321,10 @@ function Get-HwinfoReadings {
 function Convert-HwinfoTemp($reading) {
   $value = Convert-Num $reading.Value
   if ($null -eq $value) { return $null }
-  if ($reading.Unit -match "F") { return [math]::Round((($value - 32) * 5 / 9), 1) }
+  $unit = [string]$reading.Unit
+  if ($unit -match "F" -or ($unit -notmatch "C" -and $value -gt 125 -and $value -le 260)) {
+    return [math]::Round((($value - 32) * 5 / 9), 1)
+  }
   return [math]::Round([double]$value, 1)
 }
 
@@ -350,20 +356,32 @@ function Find-HwinfoExe {
 }
 
 function Enable-HwinfoShare([string]$exe) {
-  $ini = Join-Path (Split-Path $exe) "HWiNFO64.INI"
-  if (-not (Test-Path $ini)) { return }
-  try {
-    $text = [System.IO.File]::ReadAllText($ini)
-    if ($text -match "SharedMemorySupport\s*=\s*1") { return }
-    if ($text -match "SharedMemorySupport\s*=") {
-      $text = [regex]::Replace($text, "SharedMemorySupport\s*=\s*\d+", "SharedMemorySupport=1")
-    } elseif ($text -match "\[Settings\]") {
-      $text = $text -replace "\[Settings\]", "[Settings]`r`nSharedMemorySupport=1"
-    } else {
-      $text += "`r`n[Settings]`r`nSharedMemorySupport=1`r`n"
-    }
-    [System.IO.File]::WriteAllText($ini, $text)
-  } catch {}
+  $dirs = @()
+  if ($exe) { $dirs += (Split-Path $exe) }
+  $dirs += @(
+    (Join-Path $env:ProgramFiles "HWiNFO64"),
+    (Join-Path ${env:ProgramFiles(x86)} "HWiNFO64"),
+    (Join-Path $env:LOCALAPPDATA "HWiNFO64"),
+    (Join-Path $env:APPDATA "HWiNFO64"),
+    (Join-Path $env:PROGRAMDATA "HWiNFO64")
+  )
+  foreach ($dir in $dirs) {
+    if (-not $dir) { continue }
+    $ini = Join-Path $dir "HWiNFO64.INI"
+    if (-not (Test-Path $ini)) { continue }
+    try {
+      $text = [System.IO.File]::ReadAllText($ini)
+      if ($text -match "(?m)^SensorsSM\s*=\s*1\s*$") { continue }
+      if ($text -match "(?m)^SensorsSM\s*=") {
+        $text = [regex]::Replace($text, "(?m)^SensorsSM\s*=\s*\d+\s*$", "SensorsSM=1")
+      } elseif ($text -match "\[Settings\]") {
+        $text = $text -replace "\[Settings\]", "[Settings]`r`nSensorsSM=1"
+      } else {
+        $text = "[Settings]`r`nSensorsSM=1`r`n" + $text
+      }
+      [System.IO.File]::WriteAllText($ini, $text)
+    } catch {}
+  }
 }
 
 function Start-HwinfoReader {
@@ -371,21 +389,21 @@ function Start-HwinfoReader {
   $script:HwinfoStartTried = $true
   $probe = @(Get-HwinfoReadings)
   if ($probe.Count -gt 0) { return }
-  $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match "^HWiNFO" })
-  $exe = Find-HwinfoExe
-  if (-not $exe -and $running.Count -eq 0) {
+  $running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^HWiNFO" })
+  $exe = $null
+  if ($running.Count -gt 0 -and $running[0].ExecutablePath) { $exe = $running[0].ExecutablePath }
+  if (-not $exe) { $exe = Find-HwinfoExe }
+  if (-not $exe) {
     $script:HwinfoMissing = $true
     return
   }
-  if ($running.Count -gt 0) {
-    $script:HwinfoNeedsSetting = $true
-    return
+  Enable-HwinfoShare $exe
+  foreach ($proc in $running) {
+    try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
   }
-  if ($exe) {
-    Enable-HwinfoShare $exe
-    try { Start-Process -FilePath $exe -WindowStyle Minimized | Out-Null } catch {}
-    $script:HwinfoLaunched = $true
-  }
+  Start-Sleep -Milliseconds 800
+  try { Start-Process -FilePath $exe -WindowStyle Minimized | Out-Null } catch {}
+  $script:HwinfoLaunched = $true
 }
 
 function Get-LiveReading {
@@ -543,11 +561,12 @@ function Get-LiveReading {
     })
   $gpuCore = @($gpuTemps | Where-Object { $_.Label -notmatch "Hot Spot|Hotspot" })
   if ($gpuCore.Count -gt 0) { $gpuTemps = $gpuCore }
+  $gpuTemps = @($gpuTemps | Sort-Object { if ($_.Label -eq "GPU Temperature") { 0 } elseif ($_.Label -match "GPU Temperature") { 1 } else { 2 } })
   foreach ($reading in $gpuTemps) {
     $converted = Convert-HwinfoTemp $reading
     if ($null -eq $converted -or $converted -lt 1 -or $converted -gt 125) { continue }
     $sensorName = [string]$reading.Sensor
-    $pretty = $sensorName -replace "^GPU \[#\d+\]:\s*", ""
+    $pretty = $sensorName -replace "^(iGPU|dGPU|GPU) \[#\d+\]:\s*", ""
     if (-not $pretty) { $pretty = $reading.Label }
     $matched = $false
     for ($i = 0; $i -lt $gpus.Count; $i++) {
@@ -580,7 +599,7 @@ function Get-LiveReading {
     } elseif ($script:HwinfoNeedsSetting) {
       Add-Note $notes "In HWiNFO open Settings, enable Shared Memory Support, then restart HWiNFO."
     } elseif ($script:HwinfoLaunched) {
-      Add-Note $notes "HWiNFO is starting. Temperatures show up once its sensors window is open."
+      Add-Note $notes "HWiNFO was restarted with sensor sharing on. Temperatures appear once its sensors window is open."
     } else {
       Add-Note $notes "No GPU temperature yet. The log check does not wait on it."
     }
