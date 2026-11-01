@@ -2,7 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <shellapi.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,18 +11,48 @@
 #include "html.h"
 #include "books.h"
 
+#define COL_BG RGB(18, 20, 16)
+#define COL_FG RGB(232, 230, 220)
+#define COL_MUTED RGB(167, 171, 159)
+#define COL_ACCENT RGB(224, 161, 6)
+#define COL_ACCENT_FG RGB(28, 21, 3)
+#define COL_OK RGB(142, 174, 114)
+#define COL_BAD RGB(212, 101, 74)
+#define ID_RUN 1001
+#define ID_TIMER 1
+
 static HANDLE g_child = NULL;
+static HANDLE g_job = NULL;
+static HWND g_hwnd, g_kicker, g_host, g_status;
+static HWND g_cpu_lbl, g_gpu_lbl, g_load_lbl;
+static HWND g_cpu_temp, g_gpu_temp, g_load;
+static HWND g_cpu_hint, g_gpu_hint, g_load_hint;
+static HWND g_cpu_name, g_gpu_name, g_notes, g_log, g_run;
+static HFONT g_font, g_font_big, g_font_small, g_font_mono;
+static HBRUSH g_bg;
+static int g_busy = 0;
+static int g_cpu_tone = 0;
+static int g_gpu_tone = 0;
+static int g_load_tone = 0;
 
-static BOOL WINAPI on_ctrl(DWORD type) {
-  (void)type;
-  if (g_child) TerminateProcess(g_child, 0);
-  return FALSE;
-}
+typedef struct {
+  char title[96];
+  char source[96];
+  char severity[16];
+  char meaning[640];
+  int ids[8];
+  int id_count;
+  char causes[4][240];
+  int cause_count;
+  char checks[4][240];
+  int check_count;
+} Book;
 
-static void hold_error(const char *message) {
-  fprintf(stderr, "%s\nPress Enter to close.\n", message);
-  fflush(stderr);
-  getchar();
+static Book g_books[24];
+static int g_book_count = 0;
+
+static void fail(const char *message) {
+  MessageBoxA(NULL, message, "Diagnostic Chicken", MB_OK | MB_ICONERROR);
 }
 
 static int write_file(const char *path, const unsigned char *data, size_t len) {
@@ -64,10 +94,6 @@ static int port_open(void) {
   return ok;
 }
 
-static void open_desk(void) {
-  ShellExecuteA(NULL, "open", "http://127.0.0.1:47321/", NULL, NULL, SW_SHOWNORMAL);
-}
-
 static void pin_start_menu(const char *exe, const char *dir) {
   char script[MAX_PATH];
   snprintf(script, MAX_PATH, "%s\\pin.ps1", dir);
@@ -83,6 +109,7 @@ static void pin_start_menu(const char *exe, const char *dir) {
           "$shortcut = $shell.CreateShortcut($lnk)\r\n"
           "$shortcut.TargetPath = '%s'\r\n"
           "$shortcut.WorkingDirectory = '%s'\r\n"
+          "$shortcut.WindowStyle = 1\r\n"
           "$shortcut.Description = 'Diagnostic Chicken. Runs only when opened.'\r\n"
           "$shortcut.Save()\r\n",
           qexe, qdir);
@@ -103,14 +130,11 @@ static void pin_start_menu(const char *exe, const char *dir) {
   CloseHandle(pi.hProcess);
 }
 
-int main(void) {
-  SetConsoleTitleA("Diagnostic Chicken");
-  SetConsoleCtrlHandler(on_ctrl, TRUE);
-
+static int install_and_start(void) {
   const char *local = getenv("LOCALAPPDATA");
   if (!local || !local[0]) {
-    hold_error("Could not find the local app folder.");
-    return 1;
+    fail("Could not find the local app folder.");
+    return 0;
   }
 
   char dir[MAX_PATH];
@@ -123,29 +147,32 @@ int main(void) {
   snprintf(installed, MAX_PATH, "%s\\Diagnostic Chicken.exe", dir);
   if (_stricmp(running, installed) != 0) CopyFileA(running, installed, FALSE);
 
-  char ps1[MAX_PATH], html[MAX_PATH], books[MAX_PATH];
+  char ps1[MAX_PATH], html[MAX_PATH], books_path[MAX_PATH];
   snprintf(ps1, MAX_PATH, "%s\\sentinel-agent.ps1", dir);
   snprintf(html, MAX_PATH, "%s\\desk.html", dir);
-  snprintf(books, MAX_PATH, "%s\\playbooks.json", dir);
+  snprintf(books_path, MAX_PATH, "%s\\playbooks.json", dir);
   if (!write_file(ps1, ps1_bytes, ps1_bytes_len) || !write_file(html, html_bytes, html_bytes_len) ||
-      !write_file(books, books_bytes, books_bytes_len)) {
-    hold_error("Could not write Diagnostic Chicken's files.");
-    return 1;
+      !write_file(books_path, books_bytes, books_bytes_len)) {
+    fail("Could not write Diagnostic Chicken's files.");
+    return 0;
   }
 
   pin_start_menu(installed, dir);
 
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-    hold_error("Could not start networking.");
-    return 1;
+    fail("Could not start networking.");
+    return 0;
   }
   if (port_open()) {
-    printf("Diagnostic Chicken is already running. Opening the desk.\n");
-    printf("The other Diagnostic Chicken window is the one to close when you are done.\n");
-    fflush(stdout);
-    open_desk();
-    for (;;) Sleep(1000);
+    HWND existing = FindWindowW(L"DiagnosticChicken", NULL);
+    if (existing) {
+      ShowWindow(existing, SW_RESTORE);
+      SetForegroundWindow(existing);
+    } else {
+      fail("Diagnostic Chicken is already running. Close that window first.");
+    }
+    return 0;
   }
 
   char ps[MAX_PATH];
@@ -158,47 +185,835 @@ int main(void) {
   si.cb = sizeof(si);
   ZeroMemory(&pi, sizeof(pi));
   if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, dir, &si, &pi)) {
-    hold_error("Could not start Windows PowerShell.");
-    return 1;
+    fail("Could not start Windows PowerShell.");
+    return 0;
   }
 
   g_child = pi.hProcess;
-  HANDLE job = CreateJobObjectA(NULL, NULL);
-  if (job) {
+  g_job = CreateJobObjectA(NULL, NULL);
+  if (g_job) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
     ZeroMemory(&info, sizeof(info));
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info));
-    if (!AssignProcessToJobObject(job, pi.hProcess)) {
-      CloseHandle(job);
-      job = NULL;
+    SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &info, sizeof(info));
+    if (!AssignProcessToJobObject(g_job, pi.hProcess)) {
+      CloseHandle(g_job);
+      g_job = NULL;
     }
   }
   ResumeThread(pi.hThread);
   CloseHandle(pi.hThread);
 
-  int up = 0;
   for (int i = 0; i < 50; i++) {
-    if (port_open()) {
-      up = 1;
-      break;
-    }
+    if (port_open()) return 1;
     Sleep(200);
   }
-  if (!up) {
-    TerminateProcess(g_child, 1);
-    hold_error("Diagnostic Chicken did not start. Close any other Diagnostic Chicken window and try again.");
-    return 1;
+  TerminateProcess(g_child, 1);
+  fail("Diagnostic Chicken did not start. Close any other Diagnostic Chicken window and try again.");
+  return 0;
+}
+
+static const char *skip_ws(const char *p) {
+  while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+  return p;
+}
+
+static const char *span_value(const char *p, const char **out_end) {
+  p = skip_ws(p);
+  if (*p == '"') {
+    const char *q = p + 1;
+    while (*q) {
+      if (*q == '\\' && q[1]) {
+        q += 2;
+        continue;
+      }
+      if (*q == '"') {
+        *out_end = q + 1;
+        return p;
+      }
+      q++;
+    }
+    *out_end = q;
+    return p;
+  }
+  if (*p == '{' || *p == '[') {
+    int brace = 0;
+    int bracket = 0;
+    int in_str = 0;
+    for (const char *q = p; *q; q++) {
+      if (in_str) {
+        if (*q == '\\' && q[1]) {
+          q++;
+          continue;
+        }
+        if (*q == '"') in_str = 0;
+        continue;
+      }
+      if (*q == '"') {
+        in_str = 1;
+        continue;
+      }
+      if (*q == '{') brace++;
+      else if (*q == '}') brace--;
+      else if (*q == '[') bracket++;
+      else if (*q == ']') bracket--;
+      if (brace == 0 && bracket == 0) {
+        *out_end = q + 1;
+        return p;
+      }
+    }
+  }
+  const char *q = p;
+  while (*q && *q != ',' && *q != '}' && *q != ']' && *q != ' ' && *q != '\n' && *q != '\r') q++;
+  *out_end = q;
+  return p;
+}
+
+static const char *find_key(const char *s, const char *e, const char *key) {
+  size_t kn = strlen(key);
+  int brace = 0;
+  int bracket = 0;
+  int in_str = 0;
+  for (const char *p = s; p < e; p++) {
+    if (in_str) {
+      if (*p == '\\' && p + 1 < e) {
+        p++;
+        continue;
+      }
+      if (*p == '"') in_str = 0;
+      continue;
+    }
+    if (*p == '"') {
+      if (brace == 1 && bracket == 0 && (size_t)(e - (p + 1)) > kn && memcmp(p + 1, key, kn) == 0 && p[1 + kn] == '"') {
+        const char *q = skip_ws(p + kn + 2);
+        if (*q == ':') return skip_ws(q + 1);
+      }
+      in_str = 1;
+      continue;
+    }
+    if (*p == '{') brace++;
+    else if (*p == '}') brace--;
+    else if (*p == '[') bracket++;
+    else if (*p == ']') bracket--;
+  }
+  return NULL;
+}
+
+static int json_string(const char *p, char *out, size_t cap) {
+  p = skip_ws(p);
+  if (*p != '"') {
+    if (cap) out[0] = 0;
+    return 0;
+  }
+  p++;
+  size_t j = 0;
+  while (*p && *p != '"') {
+    unsigned char c = (unsigned char)*p++;
+    if (c == '\\' && *p) {
+      char e = *p++;
+      if (e == 'n') c = '\n';
+      else if (e == 'r') c = '\r';
+      else if (e == 't') c = '\t';
+      else if (e == 'u') {
+        for (int i = 0; i < 4 && *p; i++) p++;
+        c = '?';
+      } else c = (unsigned char)e;
+    }
+    if (c == '\r') continue;
+    if (j + 1 < cap) out[j++] = (char)c;
+  }
+  if (cap) out[j] = 0;
+  return 1;
+}
+
+static int json_num(const char *p, double *out) {
+  p = skip_ws(p);
+  if (*p == 'n' || *p == '"') return 0;
+  char *stop = NULL;
+  double value = strtod(p, &stop);
+  if (stop == p) return 0;
+  *out = value;
+  return 1;
+}
+
+static void copy_string_array(const char *value, char out[][240], int *count, int max_count) {
+  *count = 0;
+  if (!value || *skip_ws(value) != '[') return;
+  const char *end = NULL;
+  span_value(value, &end);
+  const char *p = skip_ws(value) + 1;
+  while (p < end && *count < max_count) {
+    p = skip_ws(p);
+    if (*p == ']') break;
+    if (*p == '"') {
+      json_string(p, out[*count], 240);
+      (*count)++;
+      const char *ve = NULL;
+      span_value(p, &ve);
+      p = ve;
+    } else break;
+    p = skip_ws(p);
+    if (*p == ',') p++;
+  }
+}
+
+static void load_books(void) {
+  char *json = (char *)malloc(books_bytes_len + 1);
+  if (!json) return;
+  memcpy(json, books_bytes, books_bytes_len);
+  json[books_bytes_len] = 0;
+  const char *p = skip_ws(json);
+  if (*p == '[') p++;
+  while (*p && g_book_count < 24) {
+    p = skip_ws(p);
+    if (*p == ']') break;
+    if (*p != '{') break;
+    const char *end = NULL;
+    span_value(p, &end);
+    Book *book = &g_books[g_book_count];
+    memset(book, 0, sizeof(*book));
+    const char *title = find_key(p, end, "title");
+    const char *source = find_key(p, end, "source");
+    const char *severity = find_key(p, end, "severity");
+    const char *meaning = find_key(p, end, "meaning");
+    if (title) json_string(title, book->title, sizeof(book->title));
+    if (source) json_string(source, book->source, sizeof(book->source));
+    if (severity) json_string(severity, book->severity, sizeof(book->severity));
+    if (meaning) json_string(meaning, book->meaning, sizeof(book->meaning));
+    const char *ids = find_key(p, end, "ids");
+    if (ids && *skip_ws(ids) == '[') {
+      const char *ip = skip_ws(ids) + 1;
+      while (book->id_count < 8) {
+        ip = skip_ws(ip);
+        if (*ip == ']') break;
+        char *stop = NULL;
+        long value = strtol(ip, &stop, 10);
+        if (stop == ip) break;
+        book->ids[book->id_count++] = (int)value;
+        ip = skip_ws(stop);
+        if (*ip == ',') ip++;
+      }
+    }
+    copy_string_array(find_key(p, end, "causes"), book->causes, &book->cause_count, 4);
+    copy_string_array(find_key(p, end, "checks"), book->checks, &book->check_count, 4);
+    if (book->title[0] && book->id_count) g_book_count++;
+    p = end;
+    p = skip_ws(p);
+    if (*p == ',') p++;
+  }
+  free(json);
+}
+
+static int http_get(const char *path, char **body) {
+  *body = NULL;
+  SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock == INVALID_SOCKET) return 0;
+  DWORD timeout = 60000;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(47321);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    closesocket(sock);
+    return 0;
+  }
+  char req[256];
+  snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", path);
+  send(sock, req, (int)strlen(req), 0);
+  size_t cap = 65536;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    closesocket(sock);
+    return 0;
+  }
+  size_t n = 0;
+  for (;;) {
+    if (n + 4096 + 1 > cap) {
+      if (cap > 1500000) break;
+      cap *= 2;
+      char *next = (char *)realloc(buf, cap);
+      if (!next) break;
+      buf = next;
+    }
+    int got = recv(sock, buf + n, 4096, 0);
+    if (got <= 0) break;
+    n += (size_t)got;
+  }
+  closesocket(sock);
+  buf[n] = 0;
+  if (strncmp(buf, "HTTP/1.1 200", 12) != 0 && strncmp(buf, "HTTP/1.0 200", 12) != 0) {
+    free(buf);
+    return 0;
+  }
+  char *sep = strstr(buf, "\r\n\r\n");
+  if (!sep) {
+    free(buf);
+    return 0;
+  }
+  char *payload = sep + 4;
+  size_t len = n - (size_t)(payload - buf);
+  memmove(buf, payload, len);
+  buf[len] = 0;
+  *body = buf;
+  return 1;
+}
+
+static void set_utf8(HWND hwnd, const char *text) {
+  if (!text) text = "";
+  int count = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+  if (count <= 0) {
+    SetWindowTextW(hwnd, L"");
+    return;
+  }
+  wchar_t *wide = (wchar_t *)malloc((size_t)count * sizeof(wchar_t));
+  if (!wide) return;
+  MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, count);
+  SetWindowTextW(hwnd, wide);
+  free(wide);
+}
+
+static int tone_of(int present, double value) {
+  if (!present) return 0;
+  if (value >= 90) return 3;
+  if (value >= 80) return 2;
+  return 1;
+}
+
+static const char *source_hint(const char *source) {
+  if (!source || !source[0]) return "";
+  if (strcmp(source, "nvidia-smi") == 0) return "nvidia-smi";
+  if (strcmp(source, "librehardwaremonitor") == 0) return "sensor driver";
+  if (strcmp(source, "acpi-thermal-zone") == 0) return "ACPI zone, not the CPU die";
+  if (strcmp(source, "unavailable") == 0) return "no sensor";
+  return "live";
+}
+
+static void format_temp(char *out, size_t cap, int present, double value) {
+  if (!present) snprintf(out, cap, "—");
+  else snprintf(out, cap, "%.0f\xC2\xB0" "C", value);
+}
+
+static void refresh_live(void) {
+  char *body = NULL;
+  if (!http_get("/live", &body)) {
+    set_utf8(g_status, "Stopped");
+    free(body);
+    return;
+  }
+  const char *end = body + strlen(body);
+  const char *cpu_at = find_key(body, end, "cpu");
+  const char *cpu_end = end;
+  if (cpu_at) span_value(cpu_at, &cpu_end);
+  char host[128] = "THIS PC";
+  const char *host_at = find_key(body, end, "host");
+  if (host_at) json_string(host_at, host, sizeof(host));
+  set_utf8(g_host, host);
+
+  double temp = 0;
+  double load = 0;
+  const char *temp_key = cpu_at ? find_key(cpu_at, cpu_end, "tempC") : NULL;
+  const char *load_key = cpu_at ? find_key(cpu_at, cpu_end, "loadPercent") : NULL;
+  int has_temp = temp_key && json_num(temp_key, &temp);
+  int has_load = load_key && json_num(load_key, &load);
+  char line[64];
+  format_temp(line, sizeof(line), has_temp, temp);
+  set_utf8(g_cpu_temp, line);
+  g_cpu_tone = tone_of(has_temp, temp);
+  if (has_load) snprintf(line, sizeof(line), "%.0f%%", load);
+  else snprintf(line, sizeof(line), "—");
+  set_utf8(g_load, line);
+  g_load_tone = has_load ? 1 : 0;
+
+  char source[64] = "";
+  const char *source_at = cpu_at ? find_key(cpu_at, cpu_end, "tempSource") : NULL;
+  if (source_at) json_string(source_at, source, sizeof(source));
+  set_utf8(g_cpu_hint, source_hint(source));
+
+  char cpu_bits[320] = "";
+  char name[180] = "";
+  const char *name_at = cpu_at ? find_key(cpu_at, cpu_end, "name") : NULL;
+  if (name_at) json_string(name_at, name, sizeof(name));
+  if (name[0]) snprintf(cpu_bits, sizeof(cpu_bits), "%s", name);
+  double cores = 0;
+  double mhz = 0;
+  const char *cores_at = cpu_at ? find_key(cpu_at, cpu_end, "cores") : NULL;
+  const char *mhz_at = cpu_at ? find_key(cpu_at, cpu_end, "maxMhz") : NULL;
+  if (cores_at && json_num(cores_at, &cores) && cores > 0) {
+    char extra[32];
+    snprintf(extra, sizeof(extra), "%s%.0f cores", cpu_bits[0] ? " · " : "", cores);
+    strncat(cpu_bits, extra, sizeof(cpu_bits) - strlen(cpu_bits) - 1);
+  }
+  if (mhz_at && json_num(mhz_at, &mhz) && mhz > 0) {
+    char extra[32];
+    snprintf(extra, sizeof(extra), "%s%.0f MHz", cpu_bits[0] ? " · " : "", mhz);
+    strncat(cpu_bits, extra, sizeof(cpu_bits) - strlen(cpu_bits) - 1);
+  }
+  set_utf8(g_cpu_name, cpu_bits);
+
+  const char *gpus = find_key(body, end, "gpus");
+  const char *best_s = NULL;
+  const char *best_e = NULL;
+  double best_temp = -1e9;
+  int best_has = 0;
+  if (gpus && *skip_ws(gpus) == '[') {
+    const char *arr_end = NULL;
+    span_value(gpus, &arr_end);
+    const char *p = skip_ws(gpus) + 1;
+    while (p < arr_end) {
+      p = skip_ws(p);
+      if (*p == ']') break;
+      if (*p != '{') break;
+      const char *obj_end = NULL;
+      span_value(p, &obj_end);
+      double card_temp = 0;
+      const char *card_temp_at = find_key(p, obj_end, "tempC");
+      int card_has = card_temp_at && json_num(card_temp_at, &card_temp);
+      if (!best_s || (card_has && card_temp >= best_temp)) {
+        best_s = p;
+        best_e = obj_end;
+        best_has = card_has;
+        if (card_has) best_temp = card_temp;
+      }
+      p = obj_end;
+      p = skip_ws(p);
+      if (*p == ',') p++;
+    }
+  }
+  if (best_s) {
+    format_temp(line, sizeof(line), best_has, best_temp);
+    set_utf8(g_gpu_temp, line);
+    g_gpu_tone = tone_of(best_has, best_temp);
+    char gpu_source[64] = "";
+    const char *gs = find_key(best_s, best_e, "tempSource");
+    if (gs) json_string(gs, gpu_source, sizeof(gpu_source));
+    double gpu_load = 0;
+    const char *gl = find_key(best_s, best_e, "loadPercent");
+    char hint[80];
+    if (gl && json_num(gl, &gpu_load)) snprintf(hint, sizeof(hint), "%s · %.0f%%", source_hint(gpu_source), gpu_load);
+    else snprintf(hint, sizeof(hint), "%s", source_hint(gpu_source));
+    set_utf8(g_gpu_hint, hint);
+    char gpu_name[220] = "";
+    char gpu_n[160] = "";
+    char driver[64] = "";
+    const char *gn = find_key(best_s, best_e, "name");
+    const char *gd = find_key(best_s, best_e, "driver");
+    if (gn) json_string(gn, gpu_n, sizeof(gpu_n));
+    if (gd) json_string(gd, driver, sizeof(driver));
+    if (gpu_n[0]) snprintf(gpu_name, sizeof(gpu_name), "%s", gpu_n);
+    if (driver[0]) {
+      char extra[80];
+      snprintf(extra, sizeof(extra), "%sdriver %s", gpu_name[0] ? " · " : "", driver);
+      strncat(gpu_name, extra, sizeof(gpu_name) - strlen(gpu_name) - 1);
+    }
+    set_utf8(g_gpu_name, gpu_name);
   }
 
-  open_desk();
-  printf("Diagnostic Chicken is running.\n");
-  printf("Close this window to stop it.\n");
-  printf("It does not start with Windows and it is not a background service.\n");
-  printf("A Start Menu shortcut named Diagnostic Chicken was added.\n");
-  fflush(stdout);
-  WaitForSingleObject(g_child, INFINITE);
-  if (job) CloseHandle(job);
-  printf("Diagnostic Chicken stopped.\n");
+  char notes[1200] = "";
+  const char *note_at = find_key(body, end, "notes");
+  if (note_at && *skip_ws(note_at) == '[') {
+    const char *note_end = NULL;
+    span_value(note_at, &note_end);
+    const char *p = skip_ws(note_at) + 1;
+    while (p < note_end) {
+      p = skip_ws(p);
+      if (*p == ']') break;
+      if (*p == '"') {
+        char note[300];
+        json_string(p, note, sizeof(note));
+        if (note[0]) {
+          if (notes[0]) strncat(notes, "\n", sizeof(notes) - strlen(notes) - 1);
+          strncat(notes, note, sizeof(notes) - strlen(notes) - 1);
+        }
+        const char *ve = NULL;
+        span_value(p, &ve);
+        p = ve;
+      } else break;
+      p = skip_ws(p);
+      if (*p == ',') p++;
+    }
+  }
+  set_utf8(g_notes, notes);
+  set_utf8(g_status, "Live");
+  free(body);
+  InvalidateRect(g_hwnd, NULL, TRUE);
+}
+
+typedef struct {
+  char *data;
+  size_t n;
+  size_t cap;
+} Buf;
+
+static void buf_add(Buf *buf, const char *text) {
+  size_t len = strlen(text);
+  if (buf->n + len + 1 > buf->cap) {
+    size_t cap = buf->cap ? buf->cap * 2 : 4096;
+    while (cap < buf->n + len + 1) cap *= 2;
+    char *next = (char *)realloc(buf->data, cap);
+    if (!next) return;
+    buf->data = next;
+    buf->cap = cap;
+  }
+  memcpy(buf->data + buf->n, text, len);
+  buf->n += len;
+  buf->data[buf->n] = 0;
+}
+
+static int contains_ci(const char *hay, const char *needle) {
+  size_t n = strlen(needle);
+  if (!n) return 1;
+  for (const char *p = hay; *p; p++) {
+    size_t i = 0;
+    while (i < n && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+    if (i == n) return 1;
+  }
+  return 0;
+}
+
+static int source_match(const char *pattern, const char *source) {
+  if (!pattern || !pattern[0] || !source || !source[0]) return 1;
+  char copy[96];
+  snprintf(copy, sizeof(copy), "%s", pattern);
+  char *part = copy;
+  while (part && *part) {
+    char *bar = strchr(part, '|');
+    if (bar) *bar = 0;
+    if (part[0] && contains_ci(source, part)) return 1;
+    part = bar ? bar + 1 : NULL;
+  }
+  return 0;
+}
+
+static int severity_rank(const char *severity) {
+  if (strcmp(severity, "urgent") == 0) return 0;
+  if (strcmp(severity, "serious") == 0) return 1;
+  if (strcmp(severity, "watch") == 0) return 2;
+  if (strcmp(severity, "noise") == 0) return 3;
+  return 9;
+}
+
+static void on_run(void) {
+  if (g_busy) return;
+  g_busy = 1;
+  EnableWindow(g_run, FALSE);
+  InvalidateRect(g_run, NULL, TRUE);
+  set_utf8(g_log, "Reading the System and Application logs…");
+  UpdateWindow(g_hwnd);
+
+  char *body = NULL;
+  if (!http_get("/diagnose", &body)) {
+    set_utf8(g_log, "The log check did not finish. Leave this window open and try again.");
+    EnableWindow(g_run, TRUE);
+    InvalidateRect(g_run, NULL, TRUE);
+    g_busy = 0;
+    return;
+  }
+  const char *end = body + strlen(body);
+  const char *events = find_key(body, end, "events");
+  typedef struct {
+    char level[24];
+    char source[120];
+    char log_name[32];
+    char message[720];
+    int id;
+  } EventRow;
+  EventRow *rows = (EventRow *)calloc(40, sizeof(EventRow));
+  int row_count = 0;
+  if (rows && events && *skip_ws(events) == '[') {
+    const char *arr_end = NULL;
+    span_value(events, &arr_end);
+    const char *p = skip_ws(events) + 1;
+    while (p < arr_end && row_count < 40) {
+      p = skip_ws(p);
+      if (*p == ']') break;
+      if (*p != '{') break;
+      const char *obj_end = NULL;
+      span_value(p, &obj_end);
+      EventRow *row = &rows[row_count];
+      const char *level = find_key(p, obj_end, "level");
+      const char *source = find_key(p, obj_end, "source");
+      const char *log_name = find_key(p, obj_end, "log");
+      const char *message = find_key(p, obj_end, "message");
+      const char *id_at = find_key(p, obj_end, "eventId");
+      if (level) json_string(level, row->level, sizeof(row->level));
+      if (source) json_string(source, row->source, sizeof(row->source));
+      if (log_name) json_string(log_name, row->log_name, sizeof(row->log_name));
+      if (message) json_string(message, row->message, sizeof(row->message));
+      double id = 0;
+      if (id_at && json_num(id_at, &id)) row->id = (int)id;
+      row_count++;
+      p = obj_end;
+      p = skip_ws(p);
+      if (*p == ',') p++;
+    }
+  }
+
+  int hit_book[24];
+  int hit_count[24];
+  int hits = 0;
+  for (int i = 0; i < row_count; i++) {
+    for (int b = 0; b < g_book_count; b++) {
+      int listed = 0;
+      for (int k = 0; k < g_books[b].id_count; k++) {
+        if (g_books[b].ids[k] == rows[i].id) listed = 1;
+      }
+      if (!listed || !source_match(g_books[b].source, rows[i].source)) continue;
+      int slot = -1;
+      for (int h = 0; h < hits; h++) {
+        if (hit_book[h] == b) slot = h;
+      }
+      if (slot >= 0) hit_count[slot]++;
+      else if (hits < 24) {
+        hit_book[hits] = b;
+        hit_count[hits] = 1;
+        hits++;
+      }
+    }
+  }
+  for (int i = 0; i < hits; i++) {
+    for (int j = i + 1; j < hits; j++) {
+      if (severity_rank(g_books[hit_book[j]].severity) < severity_rank(g_books[hit_book[i]].severity)) {
+        int tb = hit_book[i];
+        int tc = hit_count[i];
+        hit_book[i] = hit_book[j];
+        hit_count[i] = hit_count[j];
+        hit_book[j] = tb;
+        hit_count[j] = tc;
+      }
+    }
+  }
+
+  Buf buf = {0};
+  char head[80];
+  snprintf(head, sizeof(head), "%d event%s in the System and Application logs, last 2 days.\r\n", row_count, row_count == 1 ? "" : "s");
+  buf_add(&buf, head);
+  if (!hits) {
+    buf_add(&buf, row_count ? "\r\nNo saved entry for these event IDs. The messages are below.\r\n" : "\r\nNo critical, error, or warning events in the last 2 days.\r\n");
+  }
+  for (int h = 0; h < hits; h++) {
+    Book *book = &g_books[hit_book[h]];
+    buf_add(&buf, "\r\n");
+    buf_add(&buf, book->title);
+    buf_add(&buf, "  ·  ");
+    buf_add(&buf, book->severity);
+    if (hit_count[h] > 1) {
+      char times[24];
+      snprintf(times, sizeof(times), "  ·  %d", hit_count[h]);
+      buf_add(&buf, times);
+    }
+    buf_add(&buf, "\r\n");
+    buf_add(&buf, book->meaning);
+    buf_add(&buf, "\r\n");
+    if (book->cause_count) {
+      buf_add(&buf, "Likely causes\r\n");
+      for (int c = 0; c < book->cause_count; c++) {
+        buf_add(&buf, "  • ");
+        buf_add(&buf, book->causes[c]);
+        buf_add(&buf, "\r\n");
+      }
+    }
+    if (book->check_count) {
+      buf_add(&buf, "Checks\r\n");
+      for (int c = 0; c < book->check_count; c++) {
+        buf_add(&buf, "  • ");
+        buf_add(&buf, book->checks[c]);
+        buf_add(&buf, "\r\n");
+      }
+    }
+  }
+  if (row_count) buf_add(&buf, "\r\nEvents\r\n");
+  for (int i = 0; i < row_count; i++) {
+    char title[180];
+    snprintf(title, sizeof(title), "\r\n%s · %s · %d\r\n%s\r\n", rows[i].level[0] ? rows[i].level : "Event", rows[i].source, rows[i].id, rows[i].log_name);
+    buf_add(&buf, title);
+    buf_add(&buf, rows[i].message);
+    buf_add(&buf, "\r\n");
+  }
+  set_utf8(g_log, buf.data ? buf.data : "No report.");
+  free(buf.data);
+  free(rows);
+  free(body);
+  EnableWindow(g_run, TRUE);
+  InvalidateRect(g_run, NULL, TRUE);
+  g_busy = 0;
+}
+
+static HFONT make_font(int size, int weight, const wchar_t *face) {
+  return CreateFontW(size, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+}
+
+static HWND add_text(HWND parent, const wchar_t *text, HFONT font, DWORD style) {
+  HWND hwnd = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, parent, NULL, NULL, NULL);
+  SendMessageW(hwnd, WM_SETFONT, (WPARAM)font, TRUE);
+  return hwnd;
+}
+
+static void create_controls(HWND hwnd) {
+  g_kicker = add_text(hwnd, L"WINDOWS FAULT DESK", g_font_small, SS_LEFT);
+  g_host = add_text(hwnd, L"DETECTING", g_font, SS_LEFT);
+  g_status = add_text(hwnd, L"Starting", g_font, SS_RIGHT);
+  g_cpu_lbl = add_text(hwnd, L"CPU", g_font_small, SS_LEFT);
+  g_gpu_lbl = add_text(hwnd, L"GPU", g_font_small, SS_LEFT);
+  g_load_lbl = add_text(hwnd, L"CPU LOAD", g_font_small, SS_LEFT);
+  g_cpu_temp = add_text(hwnd, L"—", g_font_big, SS_LEFT);
+  g_gpu_temp = add_text(hwnd, L"—", g_font_big, SS_LEFT);
+  g_load = add_text(hwnd, L"—", g_font_big, SS_LEFT);
+  g_cpu_hint = add_text(hwnd, L"", g_font_small, SS_LEFT);
+  g_gpu_hint = add_text(hwnd, L"", g_font_small, SS_LEFT);
+  g_load_hint = add_text(hwnd, L"live", g_font_small, SS_LEFT);
+  g_cpu_name = add_text(hwnd, L"", g_font, SS_LEFT);
+  g_gpu_name = add_text(hwnd, L"", g_font, SS_LEFT);
+  g_notes = add_text(hwnd, L"", g_font_small, SS_LEFT);
+  g_run = CreateWindowW(L"BUTTON", L"Run diagnostic", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_RUN, NULL, NULL);
+  g_log = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, 0, 10, 10, hwnd, NULL, NULL, NULL);
+  SendMessageW(g_log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+  set_utf8(g_log, "This is the Diagnostic Chicken window. Close it to stop. It does not start with Windows.\r\n\r\nRun diagnostic reads critical, error, and warning events from the System and Application logs for the last 2 days.");
+}
+
+static void place(HWND hwnd, int x, int y, int w, int h) {
+  MoveWindow(hwnd, x, y, w, h, TRUE);
+}
+
+static void layout(int w, int h) {
+  int pad = 24;
+  int col = (w - pad * 2 - 24) / 3;
+  if (col < 80) col = 80;
+  place(g_kicker, pad, 16, w - pad * 2, 18);
+  place(g_host, pad, 40, w - 180, 24);
+  place(g_status, w - 150, 40, 126, 24);
+  place(g_cpu_lbl, pad, 78, col, 18);
+  place(g_gpu_lbl, pad + col + 12, 78, col, 18);
+  place(g_load_lbl, pad + (col + 12) * 2, 78, col, 18);
+  place(g_cpu_temp, pad, 96, col, 42);
+  place(g_gpu_temp, pad + col + 12, 96, col, 42);
+  place(g_load, pad + (col + 12) * 2, 96, col, 42);
+  place(g_cpu_hint, pad, 140, col, 18);
+  place(g_gpu_hint, pad + col + 12, 140, col, 18);
+  place(g_load_hint, pad + (col + 12) * 2, 140, col, 18);
+  place(g_cpu_name, pad, 166, w - pad * 2, 22);
+  place(g_gpu_name, pad, 188, w - pad * 2, 22);
+  place(g_notes, pad, 214, w - pad * 2, 52);
+  place(g_run, pad, 274, 180, 40);
+  int log_y = 330;
+  place(g_log, pad, log_y, w - pad * 2, h - log_y - pad);
+}
+
+static COLORREF tone_color(int tone) {
+  if (tone == 3) return COL_BAD;
+  if (tone == 2) return COL_ACCENT;
+  if (tone == 1) return COL_OK;
+  return COL_MUTED;
+}
+
+static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  switch (msg) {
+    case WM_CREATE:
+      create_controls(hwnd);
+      return 0;
+    case WM_SIZE:
+      if (wp != SIZE_MINIMIZED) layout(LOWORD(lp), HIWORD(lp));
+      return 0;
+    case WM_TIMER:
+      if (wp == ID_TIMER && !g_busy) refresh_live();
+      return 0;
+    case WM_COMMAND:
+      if (LOWORD(wp) == ID_RUN) on_run();
+      return 0;
+    case WM_DRAWITEM: {
+      DRAWITEMSTRUCT *item = (DRAWITEMSTRUCT *)lp;
+      if (item->CtlID != ID_RUN) break;
+      int disabled = item->itemState & ODS_DISABLED;
+      HBRUSH brush = CreateSolidBrush(disabled ? RGB(58, 56, 42) : COL_ACCENT);
+      FillRect(item->hDC, &item->rcItem, brush);
+      DeleteObject(brush);
+      SetBkMode(item->hDC, TRANSPARENT);
+      SetTextColor(item->hDC, disabled ? COL_MUTED : COL_ACCENT_FG);
+      HFONT old = (HFONT)SelectObject(item->hDC, g_font);
+      DrawTextW(item->hDC, L"Run diagnostic", -1, &item->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      SelectObject(item->hDC, old);
+      return TRUE;
+    }
+    case WM_ERASEBKGND: {
+      RECT rect;
+      GetClientRect(hwnd, &rect);
+      FillRect((HDC)wp, &rect, g_bg);
+      return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+      HDC dc = (HDC)wp;
+      HWND child = (HWND)lp;
+      SetBkColor(dc, COL_BG);
+      SetBkMode(dc, OPAQUE);
+      if (child == g_cpu_temp) SetTextColor(dc, tone_color(g_cpu_tone));
+      else if (child == g_gpu_temp) SetTextColor(dc, tone_color(g_gpu_tone));
+      else if (child == g_load) SetTextColor(dc, tone_color(g_load_tone));
+      else if (child == g_kicker || child == g_status) SetTextColor(dc, COL_ACCENT);
+      else if (child == g_cpu_hint || child == g_gpu_hint || child == g_load_hint || child == g_notes || child == g_cpu_name || child == g_gpu_name) SetTextColor(dc, COL_MUTED);
+      else SetTextColor(dc, COL_FG);
+      return (LRESULT)g_bg;
+    }
+    case WM_GETMINMAXINFO: {
+      MINMAXINFO *info = (MINMAXINFO *)lp;
+      info->ptMinTrackSize.x = 680;
+      info->ptMinTrackSize.y = 520;
+      return 0;
+    }
+    case WM_DESTROY:
+      KillTimer(hwnd, ID_TIMER);
+      if (g_child) TerminateProcess(g_child, 0);
+      if (g_job) CloseHandle(g_job);
+      PostQuitMessage(0);
+      return 0;
+    default:
+      break;
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev, LPSTR cmd, int show) {
+  (void)prev;
+  (void)cmd;
+  SetProcessDPIAware();
+  load_books();
+  if (!install_and_start()) return g_child ? 1 : 0;
+
+  g_bg = CreateSolidBrush(COL_BG);
+  g_font = make_font(-18, FW_NORMAL, L"Segoe UI");
+  g_font_big = make_font(-34, FW_SEMIBOLD, L"Segoe UI");
+  g_font_small = make_font(-14, FW_NORMAL, L"Segoe UI");
+  g_font_mono = make_font(-16, FW_NORMAL, L"Consolas");
+
+  WNDCLASSW klass;
+  ZeroMemory(&klass, sizeof(klass));
+  klass.lpfnWndProc = wndproc;
+  klass.hInstance = instance;
+  klass.lpszClassName = L"DiagnosticChicken";
+  klass.hCursor = LoadCursor(NULL, IDC_ARROW);
+  klass.hbrBackground = g_bg;
+  RegisterClassW(&klass);
+
+  g_hwnd = CreateWindowExW(0, L"DiagnosticChicken", L"Diagnostic Chicken", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 960, 760, NULL, NULL, instance, NULL);
+  if (!g_hwnd) {
+    fail("Could not open the Diagnostic Chicken window.");
+    return 1;
+  }
+  ShowWindow(g_hwnd, show);
+  UpdateWindow(g_hwnd);
+  refresh_live();
+  SetTimer(g_hwnd, ID_TIMER, 2000, NULL);
+
+  MSG message;
+  while (GetMessageW(&message, NULL, 0, 0) > 0) {
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+  }
+  DeleteObject(g_font);
+  DeleteObject(g_font_big);
+  DeleteObject(g_font_small);
+  DeleteObject(g_font_mono);
+  DeleteObject(g_bg);
   return 0;
 }

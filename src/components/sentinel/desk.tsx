@@ -216,8 +216,8 @@ export function Desk() {
 
       <p className="mb-4 text-sm text-muted">
         {link === "live"
-          ? "Connected to this PC. Names, load, and temperatures refresh while Diagnostic Chicken.exe stays open."
-          : "Hardware readings come from Diagnostic Chicken.exe on the PC. It starts only when you open it, and it stops when you close that window. Until then, the numbers here are a sample."}
+          ? "Connected to this PC. Names, load, and temperatures refresh while the Diagnostic Chicken window stays open."
+          : "The desktop app reads this PC. It starts only when you open Diagnostic Chicken, and it stops when you close that window. Until then, the numbers here are a sample."}
       </p>
 
       <section className="panel mb-4 p-4" aria-label="Temperatures">
@@ -421,8 +421,8 @@ function Bench({ notes }: { notes: string[] }) {
           <h2 className="text-lg font-semibold">What cannot be done from here</h2>
         </div>
         <ul className="mt-3 space-y-3 text-sm text-muted">
-          <li>This preview cannot see a PC. Run Diagnostic Chicken.exe on the computer you want to check.</li>
-          <li>Diagnostic Chicken.exe starts only when you open it. Closing its window stops it. It is not a service and it does not start with Windows.</li>
+          <li>This preview cannot see a PC. Open the Diagnostic Chicken desktop app on the computer you want to check.</li>
+          <li>Diagnostic Chicken is a window, not a browser page. It starts only when you open it. Closing the window stops it. It is not a service and it does not start with Windows.</li>
           <li>
             CPU die temperature still needs a sensor driver. NVIDIA temperature comes from nvidia-smi.
             AMD and Intel need LibreHardwareMonitor with WMI enabled.
@@ -434,13 +434,13 @@ function Bench({ notes }: { notes: string[] }) {
       <section className="panel p-4">
         <h2 className="text-lg font-semibold">Install on the Windows PC</h2>
         <p className="mt-2 text-sm text-muted">
-          Download Diagnostic Chicken.exe and open it. The first launch adds a Start Menu shortcut and opens the desk.
-          Nothing is added to Windows startup. Close the Diagnostic Chicken window when you are done.
+          Download Diagnostic Chicken.exe and open it. The program is its own window. The first launch adds a Start Menu shortcut.
+          Nothing is added to Windows startup. Close the window when you are done.
         </p>
         <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm text-muted">
           <li>This build is for 64-bit Windows.</li>
           <li>If the browser warns about an unsigned download, keep the file and open it.</li>
-          <li>The desk names the CPU and GPU, keeps load and temperature live, and Run diagnostic reads the System and Application logs.</li>
+          <li>The window names the CPU and GPU, keeps load and temperature live, and Run diagnostic reads the System and Application logs.</li>
         </ol>
         <a
           href="/Diagnostic%20Chicken.exe"
