@@ -157,7 +157,7 @@ namespace AmdAdl {
       try {
       if (!_ready) {
         IntPtr ctx;
-        if (ADL2_Main_Control_Create(_alloc, 1, out ctx) < 0 || ctx == IntPtr.Zero) return "";
+        if (ADL2_Main_Control_Create(_alloc, 0, out ctx) < 0 || ctx == IntPtr.Zero) return "";
         _ctx = ctx;
         _ready = true;
       }
@@ -179,6 +179,7 @@ namespace AmdAdl {
           if (present == 0) continue;
           string name = TextAt(raw, 280);
           if (name.Length == 0) name = "AMD Radeon";
+          if (name.IndexOf("Virtual", StringComparison.OrdinalIgnoreCase) >= 0 || name.IndexOf("Meta", StringComparison.OrdinalIgnoreCase) >= 0) continue;
           int temp = -1;
           int load = -1;
           var log = new ADLPMLogDataOutput();
@@ -881,6 +882,21 @@ if ($args -contains "-SensorWorker") {
   }
 }
 
+if ($args -contains "-SampleOnce") {
+  $ErrorActionPreference = "Continue"
+  try {
+    $json = Get-LiveReading | ConvertTo-Json -Depth 6 -Compress
+    $path = Join-Path $PSScriptRoot "live.json"
+    $tmp = "$path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $json)
+    if (Test-Path $path) { Remove-Item -LiteralPath $path -Force }
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+  } catch {
+    try { [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot "sample-error.txt"), $_.Exception.Message) } catch {}
+  }
+  exit 0
+}
+
 $listener = $null
 try {
   $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
@@ -908,6 +924,25 @@ function Start-SensorWorker {
 
 Start-SensorWorker
 
+function Ensure-Sample {
+  $running = $script:SampleProc -and -not $script:SampleProc.HasExited
+  if ($running -and $script:SampleStart -and ((Get-Date) - $script:SampleStart).TotalSeconds -gt 6) {
+    try { Stop-Process -Id $script:SampleProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+    $running = $false
+  }
+  if ($running) { return }
+  if ($script:SampleStart -and ((Get-Date) - $script:SampleStart).TotalSeconds -lt 2) { return }
+  try {
+    $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $script:SampleProc = Start-Process -FilePath $ps -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -ArgumentList @(
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SampleOnce"
+    )
+    $script:SampleStart = Get-Date
+  } catch {}
+}
+
+Ensure-Sample
+
 function Read-LiveJson {
   $path = Join-Path $PSScriptRoot "live.json"
   if (Test-Path $path) {
@@ -921,6 +956,7 @@ try {
   while ($true) {
     $client = $listener.AcceptTcpClient()
     Start-SensorWorker
+    Ensure-Sample
     $client.ReceiveTimeout = 5000
     $client.SendTimeout = 20000
     $stream = $null
@@ -943,15 +979,7 @@ try {
         if (-not $book) { Send-Http $stream 200 "[]" }
         else { Send-Http $stream 200 $book "application/json; charset=utf-8" }
       } elseif ($request.path -eq "/live") {
-        $json = $null
-        try {
-          $script:UseLibrary = $false
-          $json = Get-LiveReading | ConvertTo-Json -Depth 6 -Compress
-        } catch {
-          $json = $null
-        }
-        if (-not $json) { $json = Read-LiveJson }
-        Send-Http $stream 200 $json
+        Send-Http $stream 200 (Read-LiveJson)
       } elseif ($request.path -eq "/diagnose") {
         Write-Host "$(Get-Date -Format HH:mm:ss)  diagnostic"
         $json = (Get-Diagnostic | ConvertTo-Json -Depth 6 -Compress)

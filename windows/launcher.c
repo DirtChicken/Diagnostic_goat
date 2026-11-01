@@ -542,7 +542,7 @@ static void format_temp(char *out, size_t cap, int present, double celsius) {
 
 static void refresh_live(void) {
   char *body = NULL;
-  if (!http_get("/live", &body, 8000)) {
+  if (!http_get("/live", &body, 1500)) {
     set_utf8(g_status, "Connecting");
     free(body);
     return;
