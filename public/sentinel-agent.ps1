@@ -103,7 +103,7 @@ function Get-SensorPack {
 }
 
 function Get-AmdGpus {
-  if ($script:AmdFailed) { return @() }
+  if ($script:SkipAmd -or $script:AmdFailed) { return @() }
   $dll = Join-Path $env:SystemRoot "System32\atiadlxx.dll"
   if (-not (Test-Path $dll)) { return @() }
   if (-not ("AmdAdl.Api" -as [type])) {
@@ -884,13 +884,19 @@ if ($args -contains "-SensorWorker") {
 
 if ($args -contains "-SampleOnce") {
   $ErrorActionPreference = "Continue"
-  try {
-    $json = Get-LiveReading | ConvertTo-Json -Depth 6 -Compress
+  function Publish-Live($reading) {
+    $json = $reading | ConvertTo-Json -Depth 6 -Compress
     $path = Join-Path $PSScriptRoot "live.json"
     $tmp = "$path.tmp"
     [System.IO.File]::WriteAllText($tmp, $json)
     if (Test-Path $path) { Remove-Item -LiteralPath $path -Force }
     Move-Item -LiteralPath $tmp -Destination $path -Force
+  }
+  try {
+    $script:SkipAmd = $true
+    Publish-Live (Get-LiveReading)
+    $script:SkipAmd = $false
+    Publish-Live (Get-LiveReading)
   } catch {
     try { [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot "sample-error.txt"), $_.Exception.Message) } catch {}
   }
@@ -910,14 +916,22 @@ try {
 $script:SensorProc = $null
 $script:SensorNext = Get-Date
 
+function Start-HiddenPowershell([string]$mode) {
+  $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $info = New-Object System.Diagnostics.ProcessStartInfo
+  $info.FileName = $ps
+  $info.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $mode"
+  $info.WorkingDirectory = $PSScriptRoot
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  return [System.Diagnostics.Process]::Start($info)
+}
+
 function Start-SensorWorker {
   try {
     if ($script:SensorProc -and -not $script:SensorProc.HasExited) { return }
     if ((Get-Date) -lt $script:SensorNext) { return }
-    $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $script:SensorProc = Start-Process -FilePath $ps -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -ArgumentList @(
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SensorWorker"
-    )
+    $script:SensorProc = Start-HiddenPowershell "-SensorWorker"
     $script:SensorNext = (Get-Date).AddSeconds(8)
   } catch {}
 }
@@ -926,17 +940,14 @@ Start-SensorWorker
 
 function Ensure-Sample {
   $running = $script:SampleProc -and -not $script:SampleProc.HasExited
-  if ($running -and $script:SampleStart -and ((Get-Date) - $script:SampleStart).TotalSeconds -gt 6) {
+  if ($running -and $script:SampleStart -and ((Get-Date) - $script:SampleStart).TotalSeconds -gt 18) {
     try { Stop-Process -Id $script:SampleProc.Id -Force -ErrorAction SilentlyContinue } catch {}
     $running = $false
   }
   if ($running) { return }
   if ($script:SampleStart -and ((Get-Date) - $script:SampleStart).TotalSeconds -lt 2) { return }
   try {
-    $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $script:SampleProc = Start-Process -FilePath $ps -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -ArgumentList @(
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-SampleOnce"
-    )
+    $script:SampleProc = Start-HiddenPowershell "-SampleOnce"
     $script:SampleStart = Get-Date
   } catch {}
 }
@@ -949,7 +960,14 @@ function Read-LiveJson {
     try { return [System.IO.File]::ReadAllText($path) } catch {}
   }
   $hostName = $env:COMPUTERNAME
-  return "{`"kind`":`"sentinel-agent`",`"host`":`"$hostName`",`"cpu`":{`"name`":null,`"tempC`":null,`"tempSource`":`"unavailable`",`"loadPercent`":null},`"gpus`":[{`"name`":null,`"tempC`":null,`"tempSource`":`"unavailable`",`"driver`":null,`"loadPercent`":null}],`"notes`":[`"Sensors are still starting.`"]}"
+  $note = "Sensors are still starting."
+  $errFile = Join-Path $PSScriptRoot "sample-error.txt"
+  if (Test-Path $errFile) {
+    $detail = ((Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue) | Out-String).Trim()
+    if ($detail) { $note = "Sensor read failed. $detail" }
+  }
+  $note = $note.Replace('\', '\\').Replace('"', '')
+  return "{`"kind`":`"sentinel-agent`",`"host`":`"$hostName`",`"cpu`":{`"name`":null,`"tempC`":null,`"tempSource`":`"unavailable`",`"loadPercent`":null},`"gpus`":[{`"name`":null,`"tempC`":null,`"tempSource`":`"unavailable`",`"driver`":null,`"loadPercent`":null}],`"notes`":[`"$note`"]}"
 }
 
 try {
