@@ -317,9 +317,8 @@ static int amd_open(HMODULE *dll_out, void **ctx_out, int *index_out, wchar_t *n
     unsigned char *raw = buf + i * 1568;
     int vendor = *(int *)(raw + 276);
     int index = *(int *)(raw + 4);
-    int present = *(int *)(raw + 792);
     wchar_t name[220];
-    if (vendor != 0x1002 || present == 0) continue;
+    if (vendor != 0x1002) continue;
     MultiByteToWideChar(CP_ACP, 0, (char *)(raw + 280), -1, name, 220);
     if (weak_name(name)) continue;
     chosen = index;
@@ -426,40 +425,129 @@ static int poll_nvidia_pipe(void) {
   return 1;
 }
 
+static int poll_wddm(void) {
+  typedef struct { DWORD LowPart; LONG HighPart; } LUID32;
+  typedef struct {
+    WCHAR Description[128];
+    UINT VendorId;
+    UINT DeviceId;
+    UINT SubSysId;
+    UINT Revision;
+    SIZE_T DedicatedVideoMemory;
+    SIZE_T DedicatedSystemMemory;
+    SIZE_T SharedSystemMemory;
+    LUID32 AdapterLuid;
+    UINT Flags;
+  } DESC1;
+  typedef struct { LUID32 AdapterLuid; UINT hAdapter; } OPENLUID;
+  typedef struct { UINT hAdapter; UINT Type; void *Data; UINT Size; } QUERYINFO;
+  typedef struct { UINT hAdapter; } CLOSEINFO;
+  typedef struct {
+    UINT32 PhysicalAdapterIndex;
+    ULONGLONG MemoryFrequency;
+    ULONGLONG MaxMemoryFrequency;
+    ULONGLONG MaxMemoryFrequencyOC;
+    ULONGLONG MemoryBandwidth;
+    ULONGLONG PCIEBandwidth;
+    ULONG FanRPM;
+    ULONG Power;
+    ULONG Temperature;
+    UCHAR PowerStateOverride;
+  } PERF;
+  typedef HRESULT (WINAPI *CreateFactory)(const GUID *, void **);
+  typedef HRESULT (STDMETHODCALLTYPE *EnumAdapters1)(void *, UINT, void **);
+  typedef HRESULT (STDMETHODCALLTYPE *GetDesc1)(void *, DESC1 *);
+  typedef ULONG (STDMETHODCALLTYPE *Release)(void *);
+  typedef LONG (WINAPI *OpenFromLuid)(OPENLUID *);
+  typedef LONG (WINAPI *QueryInfo)(QUERYINFO *);
+  typedef LONG (WINAPI *CloseAdapter)(CLOSEINFO *);
+  static const GUID factory_iid = { 0x770aae78, 0xf26f, 0x4dba, { 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87 } };
+  HMODULE dxgi, gdi;
+  CreateFactory create;
+  void *factory = NULL;
+  int i, published = 0;
+  dxgi = LoadLibraryW(L"dxgi.dll");
+  gdi = GetModuleHandleW(L"gdi32.dll");
+  if (!dxgi || !gdi) return 0;
+  create = (CreateFactory)GetProcAddress(dxgi, "CreateDXGIFactory1");
+  if (!create || FAILED(create(&factory_iid, &factory)) || !factory) return 0;
+  for (i = 0; i < 8 && !published; i++) {
+    void **vt = *(void ***)factory;
+    void *adapter = NULL;
+    DESC1 desc;
+    EnumAdapters1 enum1 = (EnumAdapters1)vt[12];
+    if (FAILED(enum1(factory, (UINT)i, &adapter)) || !adapter) break;
+    {
+      void **avt = *(void ***)adapter;
+      GetDesc1 get = (GetDesc1)avt[10];
+      Release rel = (Release)avt[2];
+      OPENLUID open;
+      OpenFromLuid open_fn;
+      QueryInfo query_fn;
+      CloseAdapter close_fn;
+      PERF perf;
+      QUERYINFO info;
+      CLOSEINFO done;
+      double c = -1;
+      ZeroMemory(&desc, sizeof(desc));
+      if (FAILED(get(adapter, &desc))) { rel(adapter); continue; }
+      rel(adapter);
+      if ((desc.Flags & 2) || weak_name(desc.Description)) continue;
+      if (desc.VendorId != 0x1002 && desc.VendorId != 0x10DE) continue;
+      open_fn = (OpenFromLuid)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
+      query_fn = (QueryInfo)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+      close_fn = (CloseAdapter)GetProcAddress(gdi, "D3DKMTCloseAdapter");
+      if (!open_fn || !query_fn || !close_fn) break;
+      ZeroMemory(&open, sizeof(open));
+      open.AdapterLuid = desc.AdapterLuid;
+      if (open_fn(&open) < 0 || !open.hAdapter) continue;
+      ZeroMemory(&perf, sizeof(perf));
+      ZeroMemory(&info, sizeof(info));
+      info.hAdapter = open.hAdapter;
+      info.Type = 62;
+      info.Data = &perf;
+      info.Size = (UINT)sizeof(perf);
+      if (query_fn(&info) >= 0) {
+        if (perf.Temperature >= 150 && perf.Temperature <= 1500) c = perf.Temperature / 10.0;
+        else if (perf.Temperature >= 15 && perf.Temperature <= 125) c = (double)perf.Temperature;
+      }
+      done.hAdapter = open.hAdapter;
+      close_fn(&done);
+      if (c >= 15 && c <= 125) {
+        publish_gpu(desc.Description, c, -1, desc.VendorId == 0x10DE ? L"NVIDIA driver" : L"AMD driver");
+        published = 1;
+      }
+    }
+  }
+  {
+    void **vt = *(void ***)factory;
+    Release rel = (Release)vt[2];
+    rel(factory);
+  }
+  return published;
+}
+
 static DWORD WINAPI gpu_thread(LPVOID unused) {
   HMODULE dll = NULL;
   void *ctx = NULL;
-  int index = -1, amd = 0;
+  int index = -1, amd = 0, misses = 0;
   wchar_t name[220];
   (void)unused;
   name[0] = 0;
   amd = amd_open(&dll, &ctx, &index, name);
-  if (amd) {
-    int misses = 0;
-    for (;;) {
-      if (amd_sample(ctx, index, name)) misses = 0;
-      else if (++misses == 3) {
-        EnterCriticalSection(&g_lock);
-        if (g_gpu_c < 0) {
-          wcscpy(g_gpu_src, L"no sensor");
-          if (!g_note[0]) wcscpy(g_note, L"The AMD driver is installed, but it did not return a GPU temperature.");
-        }
-        LeaveCriticalSection(&g_lock);
-      }
-      Sleep(2000);
-    }
-  }
-  if (!poll_nvidia_pipe()) {
-    EnterCriticalSection(&g_lock);
-    if (g_gpu_c < 0) {
-      wcscpy(g_gpu_src, L"no sensor");
-      if (!g_note[0]) wcscpy(g_note, L"No GPU temperature from the graphics driver. The card name can still be right.");
-    }
-    LeaveCriticalSection(&g_lock);
-    return 0;
-  }
   for (;;) {
-    poll_nvidia_pipe();
+    int ok = poll_wddm();
+    if (!ok && amd) ok = amd_sample(ctx, index, name);
+    if (!ok) ok = poll_nvidia_pipe();
+    if (ok) misses = 0;
+    else if (++misses == 4) {
+      EnterCriticalSection(&g_lock);
+      if (g_gpu_c < 0) {
+        wcscpy(g_gpu_src, L"no sensor");
+        if (!g_note[0]) wcscpy(g_note, L"Adrenalin can see the GPU, but Windows did not hand that temperature to this window yet.");
+      }
+      LeaveCriticalSection(&g_lock);
+    }
     Sleep(2000);
   }
 }
